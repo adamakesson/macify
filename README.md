@@ -95,10 +95,10 @@ Program Files, keeps your settings and learned pointer speed, and starts. (Runni
 
 ### Publishing a release
 
-1. Bump the version in [`version.h`](version.h) and build.
-2. Create a release whose tag is the version (`v1.5`) and attach the built `macify.exe`.
-   The update check compares the tag with the running version and downloads the
-   attachment named exactly `macify.exe`.
+Bump the version in [`version.h`](version.h) and push to `main`. A GitHub Actions
+workflow ([`release.yml`](.github/workflows/release.yml)) then builds `macify.exe` from
+the source and publishes it as release `v<version>`, with the commits since the previous
+release as release notes. Installed copies pick it up with **Check for updates**.
 
 ## Uninstall
 
