@@ -46,6 +46,8 @@
 //   "runAtStartup": true                start Macify when you log in
 //   "runAsAdministrator": true          run with admin rights (so it also works in admin
 //                                       windows) via a scheduled task, without prompts
+//   "checkForUpdatesOnStart": true      shortly after starting, check GitHub for a newer
+//                                       version and offer it in a notification
 //   "threeFingerDragSpeed": 1.0         multiplies the three-finger drag speed
 //
 // Pointer speed is learned, not configured: while you use one finger normally, the app
@@ -120,6 +122,8 @@
 #define WM_CANCEL_DRAG (WM_APP + 2)
 #define TIMER_SAVE 3
 #define TIMER_SETTINGS 4
+#define TIMER_UPDATE_CHECK 5
+#define UPDATE_CHECK_DELAY_MS 30000  // after starting: give the network time to come up after login
 #define TASK_NAME L"Macify"
 #define OLD_NAME L"three-finger-drag"  // previous name: data folder, task, mutex
 #define ID_QUIT 100
@@ -131,6 +135,7 @@
 #define ID_DEBUG 103
 #define ID_SETTINGS 104
 #define ID_UPDATE 105
+#define ID_AUTOUPDATE 107
 #define WM_UPDATE_RESULT (WM_APP + 5)
 #define UPDATE_API L"https://api.github.com/repos/adamakesson/macify/releases/latest"
 
@@ -156,7 +161,10 @@ static void settingsLoad(bool userEdit);
 static void settingsWrite(void);
 static void settingsSetBool(const char *name, bool value);
 static void quit(void);
-static void updateCheck(void);
+static void updateCheck(bool silent);
+static void updateInstallPending(void);
+static char gPendingTag[32];               // a newer version, found and downloaded by the automatic check
+static wchar_t gPendingFile[MAX_PATH];
 static volatile bool gUpdateBusy;
 
 typedef struct {
@@ -217,6 +225,7 @@ static double gDragSpeed;
 static double gSettleUntilMs;
 static bool gRunAtStartup = true;  // settings.yaml: runAtStartup
 static bool gRunAsAdmin = true;    // settings.yaml: runAsAdministrator
+static bool gCheckUpdates = true;  // settings.yaml: checkForUpdatesOnStart
 static double gSpeedMul = 1.0;     // settings.yaml: threeFingerDragSpeed
 static int gLastScan = -1;
 static bool gVelValid, gHolding;
@@ -1326,9 +1335,12 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
   AppendMenuW(menu, MF_STRING | (gRunAtStartup ? MF_CHECKED : 0), ID_STARTUP, L"Run at startup");
   AppendMenuW(menu, MF_STRING | (gRunAsAdmin ? MF_CHECKED : 0), ID_ADMIN, L"Run as administrator");
+  AppendMenuW(menu, MF_STRING | (gCheckUpdates ? MF_CHECKED : 0), ID_AUTOUPDATE, L"Check for updates on start");
   AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
+  wchar_t install[64];
+  _snwprintf(install, 64, L"Install Macify %hs", gPendingTag[0] == 'v' ? gPendingTag + 1 : gPendingTag);
   AppendMenuW(menu, MF_STRING | (gUpdateBusy ? MF_GRAYED : 0), ID_UPDATE,
-              gUpdateBusy ? L"Checking for updates..." : L"Check for updates");
+              gPendingTag[0] ? install : gUpdateBusy ? L"Checking for updates..." : L"Check for updates");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug log (save to desktop)" : L"Start debug log");
   AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit");
@@ -1339,8 +1351,12 @@ static void showTrayMenu(void) {
   if (cmd == ID_RELEARN) { curveClear(); curveSave(); }
   if (cmd == ID_STARTUP) toggleSetting(&gRunAtStartup);
   if (cmd == ID_ADMIN) toggleSetting(&gRunAsAdmin);
+  if (cmd == ID_AUTOUPDATE) {
+    gCheckUpdates = !gCheckUpdates;
+    settingsSetBool("checkForUpdatesOnStart", gCheckUpdates);
+  }
   if (cmd == ID_SETTINGS) settingsEdit();
-  if (cmd == ID_UPDATE) updateCheck();
+  if (cmd == ID_UPDATE) { if (gPendingTag[0]) updateInstallPending(); else updateCheck(false); }
   if (cmd == ID_DEBUG) { if (gDebugOn) debugFinish(); else debugStart(); }
   if (cmd == ID_QUIT) quit();
 }
@@ -1820,6 +1836,7 @@ static void logState(void) {
   logRegString("Windows", L"ProductName");
   logRegString("Windows version", L"DisplayVersion");
   logRegString("Windows build", L"CurrentBuild");
+  LOG("check for updates on start: %s\n", gCheckUpdates ? "on" : "off");
   LOG("admin rights: %s, installed copy: %s, run at startup: %s\n", isElevated() ? "yes" : "no",
       isInstalledCopy() ? "yes" : "no", gRunAtStartup ? "on" : "off");
   LOG("pointer settings: touchpad cursor speed %d, mouse speed %d, enhance precision %d\n",
@@ -1902,11 +1919,12 @@ static void debugFinish(void) {
 #define FOUND_ADMIN   2
 #define FOUND_SPEED   4
 #define FOUND_REMAPS  8
-#define FOUND_ALL     15
-#define FOUND_OBSOLETE 16  // a setting that no longer exists: rewrite the file without it
+#define FOUND_UPDATES 16
+#define FOUND_ALL     31
+#define FOUND_OBSOLETE 32  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
-  bool runAtStartup, runAsAdmin;
+  bool runAtStartup, runAsAdmin, checkUpdates;
   double speed;
   Remap remaps[MAX_REMAPS];
   int remapCount;
@@ -2143,6 +2161,9 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       st->found |= FOUND_REMAPS;
       st->remapCount = 0;
       inRemaps = !*value;
+    } else if (!strcmp(key, "checkForUpdatesOnStart")) {
+      if (!yamlBool(value, &st->checkUpdates)) { snprintf(err, errLen, "%s must be true or false (line %d)", key, lineNo); return false; }
+      st->found |= FOUND_UPDATES;
     } else if (!strcmp(key, "runAtStartup") || !strcmp(key, "runAsAdministrator")) {
       bool *flag = !strcmp(key, "runAtStartup") ? &st->runAtStartup : &st->runAsAdmin;
       if (!yamlBool(value, flag)) { snprintf(err, errLen, "%s must be true or false (line %d)", key, lineNo); return false; }
@@ -2171,6 +2192,8 @@ static const char kHelpStartup[] =
   "# Start Macify when you log in: true or false.\n";
 static const char kHelpAdmin[] =
   "# Run with admin rights, so it also works in admin windows: true or false.\n";
+static const char kHelpUpdates[] =
+  "# When Macify starts, check GitHub for a newer version and offer to install it: true or false.\n";
 static const char kHelpSpeed[] =
   "# Multiplies the three-finger drag speed. 1.0 matches the normal pointer, 1.5 is 50% faster.\n";
 static const char kHelpRemaps[] =
@@ -2214,9 +2237,10 @@ static void settingsWrite(void) {
   snprintf(speed, sizeof speed, gSpeedMul == floor(gSpeedMul) ? "%.1f" : "%g", gSpeedMul);
   FILE *f = _wfopen(path, L"wb");
   if (!f) return;
-  fprintf(f, "%s\n%srunAtStartup: %s\n\n%srunAsAdministrator: %s\n\n%sthreeFingerDragSpeed: %s\n\n%s",
+  fprintf(f, "%s\n%srunAtStartup: %s\n\n%srunAsAdministrator: %s\n\n%scheckForUpdatesOnStart: %s\n\n"
+             "%sthreeFingerDragSpeed: %s\n\n%s",
           kHelpTop, kHelpStartup, gRunAtStartup ? "true" : "false", kHelpAdmin, gRunAsAdmin ? "true" : "false",
-          kHelpSpeed, speed, kHelpRemaps);
+          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
   fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
@@ -2262,6 +2286,31 @@ static void settingsSetBool(const char *name, bool value) {
   settingsWrite();
 }
 
+// Adds a setting (with its explanation) to the file without touching the rest: before
+// the line starting with "before", or at the end.
+static void settingsInsertLine(const char *help, const char *line, const char *before) {
+  wchar_t path[MAX_PATH];
+  if (!settingsPath(path)) return;
+  static char text[8192];
+  FILE *f = _wfopen(path, L"rb");
+  size_t n = f ? fread(text, 1, sizeof text - 1, f) : 0;
+  if (f) fclose(f);
+  text[n] = 0;
+  char *at = NULL;
+  for (char *l = text; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL)
+    if (!strncmp(l, before, strlen(before))) { at = l; break; }
+  f = _wfopen(path, L"wb");
+  if (!f) return;
+  if (at) {
+    fwrite(text, 1, (size_t)(at - text), f);
+    fprintf(f, "%s%s\n\n%s", help, line, at);
+  } else {
+    fprintf(f, "%s%s\n%s%s\n", text, n && text[n - 1] != '\n' ? "\n" : "", help, line);
+  }
+  fclose(f);
+  markOwnWrite(path);
+}
+
 // Applies parsed settings. userEdit: the user saved the file, so confirm the changes.
 static void settingsApply(Settings *st, bool userEdit) {
   if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount);
@@ -2273,13 +2322,16 @@ static void settingsApply(Settings *st, bool userEdit) {
   ReleaseSRWLockShared(&gRemapLock);
   gRunAtStartup = st->runAtStartup;
   gRunAsAdmin = st->runAsAdmin;
+  gCheckUpdates = st->checkUpdates;
   gSpeedMul = st->speed;
   setRemaps(st->remaps, st->remapCount);
-  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f, %d key remaps\n",
-      gRunAtStartup, gRunAsAdmin, gSpeedMul, gRemapCount);
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, threeFingerDragSpeed %.2f, %d key remaps\n",
+      gRunAtStartup, gRunAsAdmin, gCheckUpdates, gSpeedMul, gRemapCount);
   if (st->skipped[0]) LOG("settings: skipped %s\n", st->skipped);
   // From an older version: add missing settings (and the explanation), drop removed ones.
-  if (st->found != FOUND_ALL) settingsWrite();
+  if ((st->found & ~FOUND_OBSOLETE) == (FOUND_ALL & ~FOUND_UPDATES) && !(st->found & FOUND_OBSOLETE))
+    settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Multiplies the three-finger drag speed");
+  else if (st->found != FOUND_ALL) settingsWrite();
 
   if (st->skipped[0]) {
     _snwprintf(gSettingsError, 256, L"Skipped %hs. The other settings are applied.", st->skipped);
@@ -2294,7 +2346,7 @@ static void settingsApply(Settings *st, bool userEdit) {
 
 static void settingsDefaults(Settings *st) {
   memset(st, 0, sizeof *st);
-  st->runAtStartup = st->runAsAdmin = true;  // for anything the file leaves out
+  st->runAtStartup = st->runAsAdmin = st->checkUpdates = true;  // for anything the file leaves out
   st->speed = 1.0;
 }
 
@@ -2376,6 +2428,7 @@ static void settingsEdit(void) {
 // Program Files the same way a first install does, and starts.
 
 typedef struct {
+  bool silent; // the automatic check: only speak up when there's an update
   int status;  // 0: up to date, 1: newer version downloaded, 2: no releases, -1: error
   char tag[32];
   wchar_t file[MAX_PATH];
@@ -2466,10 +2519,10 @@ static int compareVersions(const char *a, const char *b) {
   return 0;
 }
 
-static DWORD WINAPI updateThread(LPVOID unused) {
-  (void)unused;
+static DWORD WINAPI updateThread(LPVOID silent) {
   UpdateResult *res = calloc(1, sizeof *res);
   if (!res) { gUpdateBusy = false; return 0; }
+  res->silent = silent != NULL;
   char *body = NULL;
   size_t len = 0;
   DWORD status = 0;
@@ -2530,17 +2583,55 @@ static DWORD WINAPI updateThread(LPVOID unused) {
   return 0;
 }
 
-static void updateCheck(void) {
+static void updateCheck(bool silent) {
   if (gUpdateBusy) return;
   gUpdateBusy = true;
-  HANDLE t = CreateThread(NULL, 0, updateThread, NULL, 0, NULL);
+  HANDLE t = CreateThread(NULL, 0, updateThread, silent ? (LPVOID)1 : NULL, 0, NULL);
   if (t) CloseHandle(t);
   else gUpdateBusy = false;
+}
+
+// Starts the downloaded update with "--update"; it takes over once we've quit.
+static void startUpdate(const wchar_t *file) {
+  wchar_t params[32];
+  _snwprintf(params, 32, L"--update %lu", GetCurrentProcessId());
+  SHELLEXECUTEINFOW sei = { 0 };
+  sei.cbSize = sizeof sei;
+  sei.lpVerb = L"runas";  // admin rights for Program Files (no prompt if already elevated)
+  sei.lpFile = file;
+  sei.lpParameters = params;
+  sei.nShow = SW_HIDE;
+  if (ShellExecuteExW(&sei)) quit();
+}
+
+// The automatic check found (and downloaded) an update, and you chose to install it.
+static void updateInstallPending(void) {
+  if (!gPendingTag[0]) return;
+  if (GetFileAttributesW(gPendingFile) == INVALID_FILE_ATTRIBUTES) {  // download went missing: fetch again
+    gPendingTag[0] = 0;
+    updateCheck(false);
+    return;
+  }
+  startUpdate(gPendingFile);
 }
 
 static void updateResult(UpdateResult *res) {
   gUpdateBusy = false;
   wchar_t msg[256];
+  if (res->silent) {  // automatic check: only an available update is worth a notification
+    LOG("automatic update check: status %d %s %s\n", res->status, res->tag, res->error);
+    if (res->status == 1) {
+      snprintf(gPendingTag, sizeof gPendingTag, "%s", res->tag);
+      wcscpy(gPendingFile, res->file);
+      _snwprintf(msg, 256, L"Click here to install it, or choose \"Install Macify %hs\" in the tray menu.",
+                 res->tag[0] == 'v' ? res->tag + 1 : res->tag);
+      wchar_t title[64];
+      _snwprintf(title, 64, L"Macify %hs is available", res->tag[0] == 'v' ? res->tag + 1 : res->tag);
+      trayNotify(title, msg);
+    }
+    free(res);
+    return;
+  }
   if (res->status == 0) {
     _snwprintf(msg, 256, L"You have the latest version, %hs.", MACIFY_VERSION_STR);
     trayNotify(L"Macify is up to date", msg);
@@ -2552,15 +2643,7 @@ static void updateResult(UpdateResult *res) {
   } else {
     _snwprintf(msg, 256, L"Macify %hs is available (you have %hs).\n\nInstall it now?", res->tag, MACIFY_VERSION_STR);
     if (MessageBoxW(gWnd, msg, L"Macify update", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) == IDYES) {
-      wchar_t params[32];
-      _snwprintf(params, 32, L"--update %lu", GetCurrentProcessId());
-      SHELLEXECUTEINFOW sei = { 0 };
-      sei.cbSize = sizeof sei;
-      sei.lpVerb = L"runas";  // admin rights for Program Files (no prompt if already elevated)
-      sei.lpFile = res->file;
-      sei.lpParameters = params;
-      sei.nShow = SW_HIDE;
-      if (ShellExecuteExW(&sei)) quit();  // the update takes over once we're gone
+      startUpdate(res->file);
     } else {
       DeleteFileW(res->file);
     }
@@ -2625,6 +2708,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
       if (wp == TIMER_RELEASE) { endDrag(); return 0; }
       if (wp == TIMER_SETTINGS) { KillTimer(w, TIMER_SETTINGS); settingsLoad(true); return 0; }
+      if (wp == TIMER_UPDATE_CHECK) { KillTimer(w, TIMER_UPDATE_CHECK); if (gCheckUpdates) updateCheck(true); return 0; }
       if (wp == TIMER_TRAY_RETRY) { trayAdd(); return 0; }
       if (wp == TIMER_SAVE) {
         checkSettings();
@@ -2641,6 +2725,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_TRAY:
       if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) showTrayMenu();
+      if (lp == NIN_BALLOONUSERCLICK && gPendingTag[0]) updateInstallPending();  // "an update is available" clicked
       return 0;
     case WM_SETTINGCHANGE:
       if (lp && wcscmp((LPCWSTR)lp, L"ImmersiveColorSet") == 0) trayRefreshIcon();
@@ -2773,6 +2858,7 @@ static int run(void) {
   cleanUpdateDownloads();
   if (gSettingsError[0]) { trayNotify(L"Macify settings", gSettingsError); gSettingsError[0] = 0; }
   applyStartup();
+  if (gCheckUpdates) SetTimer(gWnd, TIMER_UPDATE_CHECK, UPDATE_CHECK_DELAY_MS, NULL);
   if (takeFlag(L"just-updated")) {
     wchar_t msg[96];
     _snwprintf(msg, 96, L"You're now running Macify %hs.", MACIFY_VERSION_STR);

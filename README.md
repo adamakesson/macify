@@ -118,11 +118,12 @@ Built for Windows 10/11 with a Precision Touchpad.
 
 Tray icon → **Edit settings** opens `%APPDATA%\Macify\settings.yaml`. Changes apply as
 soon as you save; a notification confirms them, or says what's wrong with the file. The
-startup options can also be switched from the tray menu, which updates the file.
+startup and update options can also be switched from the tray menu, which updates the file.
 
 ```yaml
 runAtStartup: true
 runAsAdministrator: true
+checkForUpdatesOnStart: true
 threeFingerDragSpeed: 1.0
 keyRemaps:
   Ctrl+D: Delete
@@ -136,6 +137,7 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 |---|---|
 | `runAtStartup` | Start Macify when you log in |
 | `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
+| `checkForUpdatesOnStart` | Shortly after Macify starts, check here for a newer version. If there is one, it's downloaded in the background and a notification offers it: click it, or choose **Install Macify …** in the tray menu. Silent when there's nothing new |
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
 
@@ -149,7 +151,9 @@ It never records what you type. Logging costs nothing while off.
 
 ## Updating
 
-Tray icon → **Check for updates**. If a newer release is published here, Macify downloads
+With `checkForUpdatesOnStart` on (the default), Macify looks for updates shortly after it
+starts and offers a new version in a notification. Or check yourself any time: tray icon →
+**Check for updates**. If a newer release is published here, Macify downloads
 it and asks before installing: the update closes the running copy, replaces the one in
 Program Files, keeps your settings and learned pointer speed, and starts. (Running a newer
 `macify.exe` by hand does the same, after a UAC prompt.)
