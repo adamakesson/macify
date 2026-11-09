@@ -2163,14 +2163,18 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
   return true;
 }
 
-static const char kSettingsHelp[] =
-  "# Macify settings. Changes apply as soon as you save this file.\n"
-  "#\n"
-  "# runAtStartup: start Macify when you log in (true or false).\n"
-  "# runAsAdministrator: run with admin rights, so it also works in admin windows.\n"
-  "# threeFingerDragSpeed: multiplies the three-finger drag speed (1.0 = normal pointer).\n"
-  "#\n"
-  "# keyRemaps: one line per remap, indented: keys you press: keys sent instead\n"
+// Explanations written above each setting (the file is rewritten only on first run and
+// when converting from an older version; otherwise your own edits and comments stay).
+static const char kHelpTop[] =
+  "# Macify settings. Changes apply as soon as you save this file.\n";
+static const char kHelpStartup[] =
+  "# Start Macify when you log in: true or false.\n";
+static const char kHelpAdmin[] =
+  "# Run with admin rights, so it also works in admin windows: true or false.\n";
+static const char kHelpSpeed[] =
+  "# Multiplies the three-finger drag speed. 1.0 matches the normal pointer, 1.5 is 50% faster.\n";
+static const char kHelpRemaps[] =
+  "# Key remaps, one indented line each:  keys you press: keys sent instead\n"
   "#   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
   "#   Modifiers: Ctrl, Alt, Shift, Win\n"
   "#   Keys: A-Z, 0-9, F1-F24, Delete, Backspace, Enter, Tab, Esc, Space, Left, Right,\n"
@@ -2180,10 +2184,8 @@ static const char kSettingsHelp[] =
   "#   In the keys you press, Ctrl also means the left Windows key, and Win can't be used.\n"
   "#   A remap only happens with exactly those modifiers held: Ctrl+D isn't Ctrl+Shift+D.\n"
   "#   Delete keyRemaps to get the default remaps back; keyRemaps: {} turns them all off.\n"
-  "#\n"
-  "# Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"
-  "# Windows key, and Ctrl+click or Alt+click is a right-click.\n"
-  "\n";
+  "#   Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"
+  "#   Windows key, and Ctrl+click or Alt+click is a right-click.\n";
 
 // Writes a key or value, quoted only if YAML would otherwise misread it.
 static void yamlPut(FILE *f, const char *text) {
@@ -2212,11 +2214,9 @@ static void settingsWrite(void) {
   snprintf(speed, sizeof speed, gSpeedMul == floor(gSpeedMul) ? "%.1f" : "%g", gSpeedMul);
   FILE *f = _wfopen(path, L"wb");
   if (!f) return;
-  fprintf(f, "%s"
-             "runAtStartup: %s\n"
-             "runAsAdministrator: %s\n"
-             "threeFingerDragSpeed: %s\n",
-          kSettingsHelp, gRunAtStartup ? "true" : "false", gRunAsAdmin ? "true" : "false", speed);
+  fprintf(f, "%s\n%srunAtStartup: %s\n\n%srunAsAdministrator: %s\n\n%sthreeFingerDragSpeed: %s\n\n%s",
+          kHelpTop, kHelpStartup, gRunAtStartup ? "true" : "false", kHelpAdmin, gRunAsAdmin ? "true" : "false",
+          kHelpSpeed, speed, kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
   fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
