@@ -22,11 +22,6 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
 - **Ctrl+click and Alt+click** give a plain right-click, and a three-finger drag started
   with Ctrl or Alt held is a right-button drag.
 
-No settings window: a few settings live in a small file (see [Settings](#settings)), the
-rest are constants at the top of [`macify.c`](macify.c). A tray icon has a menu to edit
-the settings, relearn the pointer speed, turn start-with-Windows on or off, record a debug
-log and quit.
-
 ## Three-finger drag
 
 - The cursor follows **whichever finger moves the most**, like ThreeFingerDragOnWindows.
