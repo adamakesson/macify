@@ -20,8 +20,10 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
 
 - **Three-finger drag** on Precision Touchpads, like macOS: put three fingers down and move
   to drag windows or select text, as if holding the left button.
-- **Mac-style shortcuts**: the left Windows key acts as Ctrl (Cmd), plus a handful of
-  shortcuts for a Swedish keyboard layout (see [Keyboard](#keyboard)).
+- **The Windows key acts as Ctrl**, in the place of a Mac's Cmd key (see
+  [Windows key = Ctrl key](#windows-key--ctrl-key)).
+- **Key remaps**: Mac-style shortcuts for a Swedish keyboard layout, which you can change
+  in the settings file (see [Key remaps](#key-remaps)).
 - **Ctrl+click and Alt+click** give a plain right-click, and a three-finger drag started
   with Ctrl or Alt held is a right-button drag.
 
@@ -45,24 +47,62 @@ log and quit.
   real (some touchpads briefly report several times the real movement when a sideways drag
   starts fast). None of this limits how fast you can drag.
 
-## Keyboard
+## Windows key = Ctrl key
+
+- The **left Windows key acts as Ctrl**, sitting where a Mac's Cmd key is: Win+C copies,
+  Win+W closes a tab, Win+click opens a link in a new tab, and so on.
+- Since that takes the Windows key's own role, **left Alt+W acts as the Windows key**,
+  held for as long as W is held: alone it opens Start, and with other keys it makes
+  Windows-key shortcuts (Alt+W+E opens File Explorer, Alt+W+Shift+S takes a screenshot).
+  The one exception is Alt+W+L: Windows only lets a physical Windows key lock the PC.
+
+This is always on and can't be changed in the settings file.
+
+## Key remaps
+
+Shortcuts that send other keys instead. These are the defaults:
 
 | Keys | Result |
 |---|---|
-| Left Win | Ctrl |
 | Ctrl+D, Ctrl+Backspace | Delete |
 | Ctrl+2, 3, 4, 7, 8, 9, 0 | AltGr symbol on that key (`@ £ $ { [ ] }`) |
 | Ctrl+`<`, Ctrl+`´` | `\|` |
 | Ctrl+H | Win+M (minimise all) |
 | Ctrl+I | Ctrl+Shift+C |
 | Ctrl+Shift+7 | Alt+Shift+A |
-| Left Alt+W | Windows key, held for as long as W is: alone it opens Start, with other keys it makes Windows-key shortcuts (Alt+W+E: File Explorer) |
-| Ctrl+click or Alt+click | right-click (physical Ctrl key only; Win+click stays Ctrl+click) |
 
-"Ctrl" includes the left Win key. Each shortcut fires only with exactly those modifiers
-held, the way AutoHotkey hotkeys do. These are the defaults: the shortcuts can be changed
-in the settings file (see [Key remaps](#key-remaps)). The left Win key as Ctrl, left
-Alt+W as the Windows key, and Ctrl/Alt+click as right-click are always on.
+"Ctrl" includes the left Windows key. A remap only fires with exactly those modifiers
+held, the way AutoHotkey hotkeys do: Ctrl+D doesn't fire for Ctrl+Shift+D. Modifiers that
+aren't part of the keys sent are released for that moment, so Ctrl+D sends a plain Delete.
+
+### Changing them
+
+The remaps are the `keyRemaps` part of the [settings file](#settings), one indented line
+each, `keys you press: keys sent instead`:
+
+```yaml
+keyRemaps:
+  Ctrl+D: Delete
+  Ctrl+H: Win+M
+```
+
+- Keys are written as modifiers joined with `+`, then one key: `Ctrl+Shift+7`.
+- Modifiers: `Ctrl`, `Alt`, `Shift`, `Win`.
+- Keys: `A`–`Z`, `0`–`9`, `F1`–`F24`, `Delete`, `Backspace`, `Enter`, `Tab`, `Esc`,
+  `Space`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`,
+  `PrintScreen`, or a character that has its own key on your keyboard layout, like `<`
+  or `´` (the `+` key is written `Ctrl++`). Keys containing `#` or `:` need quotes:
+  `"Ctrl+#": Delete`.
+- In the keys you press, `Ctrl` also means the left Windows key, and `Win` can't be used.
+  `Alt+W` is reserved for the Windows key.
+- An entry with a mistake is skipped, with a notification saying why; the others still
+  work. Remove `keyRemaps` to get the defaults back; `keyRemaps: {}` turns them all off.
+
+## Ctrl+click and Alt+click
+
+Holding the **physical Ctrl key** or **Alt** while clicking gives apps a plain right-click,
+like Control+click on a Mac (Win+click stays Ctrl+click). A three-finger drag started with
+Ctrl or Alt held is a right-button drag. This is always on.
 
 ## Setup
 
@@ -91,8 +131,7 @@ runAsAdministrator: true
 threeFingerDragSpeed: 1.0
 keyRemaps:
   Ctrl+D: Delete
-  Ctrl+H: Win+M
-  # ... the other shortcuts from the Keyboard table
+  # ... the other key remaps
 ```
 
 The file starts with a comment explaining every setting. (Versions up to 1.8 used
@@ -103,26 +142,7 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `runAtStartup` | Start Macify when you log in |
 | `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
-| `keyRemaps` | Keyboard shortcuts, see below |
-
-### Key remaps
-
-Each entry is an indented line under `keyRemaps:`, `keys you press: keys sent instead`,
-for example `Ctrl+H: Win+M`.
-
-- Keys are written as modifiers joined with `+`, then one key: `Ctrl+Shift+7`.
-- Modifiers: `Ctrl`, `Alt`, `Shift`, `Win`.
-- Keys: `A`–`Z`, `0`–`9`, `F1`–`F24`, `Delete`, `Backspace`, `Enter`, `Tab`, `Esc`,
-  `Space`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`,
-  `PrintScreen`, or a character that has its own key on your keyboard layout, like `<`
-  or `´` (the `+` key is written `Ctrl++`). Keys containing `#` or `:` need quotes:
-  `"Ctrl+#": Delete`.
-- In the keys you press, `Ctrl` also means the left Windows key, and `Win` can't be used.
-  `Alt+W` is reserved for the Windows key.
-- A remap only fires with exactly those modifiers held: `Ctrl+D` doesn't fire for
-  Ctrl+Shift+D. Modifiers that aren't part of the keys sent are released for that moment.
-- An entry with a mistake is skipped, with a notification saying why; the others still
-  work. Remove `keyRemaps` to get the defaults back; `keyRemaps: {}` turns them all off.
+| `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
 
 ## Debug log
 
