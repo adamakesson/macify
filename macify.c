@@ -6,7 +6,10 @@
 //   - Three-finger gestures: Swipes = Nothing, Taps = Nothing
 //   - Turn off "Tap twice and drag to multi-select"
 // To stop it: tray icon > Quit (or taskkill /im macify.exe)
-// On start it adds/updates a "Macify" Start menu shortcut pointing at this exe.
+// Installing: run macify.exe from anywhere (e.g. Downloads). After one UAC prompt it copies
+// itself to C:\Program Files\Macify, registers the startup task for that copy and starts
+// it. Running a newer macify.exe the same way updates it: the running copy is closed and
+// replaced. (The debug build never installs.) It also keeps a "Macify" Start menu shortcut.
 // Start with Windows as administrator: on first run (one UAC prompt) it registers a
 // scheduled task "Macify" that starts it elevated at logon. Whenever it is
 // started without admin rights while that task exists, it starts the task instead, so
@@ -180,6 +183,7 @@ static volatile HWND gHookWnd;          // remap thread's window
 static volatile bool gPhysCtrl, gPhysAlt;  // physical Ctrl / Alt held (set by the remap thread)
 static bool gDragRight;                 // current three-finger drag uses the right button
 static HANDLE gMutex;
+static UINT gQuitMsg;  // "MacifyQuit": a newer copy asks the running one to close
 #ifndef TFD_DEBUG
 static bool gAutostart;
 static void toggleAutostart(void);
@@ -1275,11 +1279,63 @@ static void xmlEscape(const wchar_t *in, wchar_t *out, size_t n) {
   out[o] = 0;
 }
 
-// Runs elevated (--install): registers the logon task. Unlike a plain schtasks /create,
+// Where the installed copy lives: C:\Program Files\Macify\macify.exe
+static bool installedPath(wchar_t *path, wchar_t *dir) {
+  const wchar_t *pf = _wgetenv(L"ProgramW6432");
+  if (!pf) pf = _wgetenv(L"ProgramFiles");
+  if (!pf) return false;
+  _snwprintf(dir, MAX_PATH, L"%ls\\Macify", pf);
+  _snwprintf(path, MAX_PATH, L"%ls\\Macify\\macify.exe", pf);
+  return true;
+}
+
+static bool isInstalledCopy(void) {
+  wchar_t exe[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], targetDir[MAX_PATH];
+  return exePath(exe, dir) && installedPath(target, targetDir) && _wcsicmp(exe, target) == 0;
+}
+
+// Closes running copies of Macify except the one that asked for the install (skipPid).
+// They may be elevated: their windows let this message through.
+static HWND otherInstance(DWORD skipPid) {
+  for (HWND w = NULL; (w = FindWindowExW(NULL, w, L"MacifyWindow", NULL)) != NULL;) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid != skipPid) return w;
+  }
+  return NULL;
+}
+
+static bool stopRunningInstance(DWORD skipPid) {
+  HWND w = otherInstance(skipPid);
+  if (!w) return true;
+  if (!gQuitMsg) gQuitMsg = RegisterWindowMessageW(L"MacifyQuit");
+  PostMessageW(w, gQuitMsg, 0, 0);
+  for (int i = 0; i < 50; i++) {
+    Sleep(100);
+    if (!otherInstance(skipPid)) return true;
+  }
+  return false;
+}
+
+// Runs elevated (--install): copies this exe to Program Files and registers the logon task. Unlike a plain schtasks /create,
 // the XML also lets it run on battery and without the default 3-day time limit.
-static int installTask(const wchar_t *user) {
+static int installTask(const wchar_t *user, DWORD callerPid) {
   wchar_t exe[MAX_PATH], dir[MAX_PATH], eExe[MAX_PATH * 2], eDir[MAX_PATH * 2], eUser[512], fallback[512];
   if (!exePath(exe, dir)) return 1;
+  wchar_t target[MAX_PATH], targetDir[MAX_PATH];
+  if (!installedPath(target, targetDir)) return 1;
+  CreateDirectoryW(targetDir, NULL);
+  if (_wcsicmp(exe, target) != 0) {  // install or update the copy in Program Files
+    stopRunningInstance(callerPid);  // the running copy keeps its exe locked
+    bool copied = false;
+    for (int i = 0; i < 40 && !copied; i++) {  // the previous copy may take a moment to exit
+      copied = CopyFileW(exe, target, FALSE);
+      if (!copied) Sleep(250);
+    }
+    if (!copied) return 2;
+  }
+  wcscpy(exe, target);
+  wcscpy(dir, targetDir);
   if (!user || !*user) {
     const wchar_t *d = _wgetenv(L"USERDOMAIN"), *u = _wgetenv(L"USERNAME");
     if (!d || !u) return 1;
@@ -1332,9 +1388,10 @@ static bool autostartInstalled(void) {
 }
 
 // Runs this exe with admin rights (UAC prompt unless already elevated) and waits for it.
-static bool runElevated(const wchar_t *params) {
+// Returns its exit code, or -1 if it couldn't start (e.g. the UAC prompt was declined).
+static int runElevated(const wchar_t *params) {
   wchar_t exe[MAX_PATH], dir[MAX_PATH];
-  if (!exePath(exe, dir)) return false;
+  if (!exePath(exe, dir)) return -1;
   SHELLEXECUTEINFOW sei = { 0 };
   sei.cbSize = sizeof sei;
   sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
@@ -1342,40 +1399,56 @@ static bool runElevated(const wchar_t *params) {
   sei.lpFile = exe;
   sei.lpParameters = params;
   sei.nShow = SW_HIDE;
-  if (!ShellExecuteExW(&sei) || !sei.hProcess) return false;  // e.g. UAC prompt declined
+  if (!ShellExecuteExW(&sei) || !sei.hProcess) return -1;
   WaitForSingleObject(sei.hProcess, 30000);
   DWORD code = 1;
   GetExitCodeProcess(sei.hProcess, &code);
   CloseHandle(sei.hProcess);
-  return code == 0;
+  return (int)code;
 }
 
-static bool installViaUac(void) {
+// 0: installed, -1: UAC prompt declined, other: failed
+static int installViaUac(void) {
   wchar_t exe[MAX_PATH], dir[MAX_PATH], params[600];
   const wchar_t *d = _wgetenv(L"USERDOMAIN"), *u = _wgetenv(L"USERNAME");
-  if (!exePath(exe, dir) || !d || !u) return false;
+  if (!exePath(exe, dir) || !d || !u) return 1;
   // Pass our user along, in case the UAC prompt was answered with another admin account.
-  _snwprintf(params, 600, L"--install \"%ls\\%ls\"", d, u);
-  if (!runElevated(params)) return false;
-  setMarker(exe);
+  _snwprintf(params, 600, L"--install \"%ls\\%ls\" %lu", d, u, GetCurrentProcessId());
+  int code = runElevated(params);
+  if (code != 0) return code;
+  wchar_t target[MAX_PATH], targetDir[MAX_PATH];
+  if (installedPath(target, targetDir)) setMarker(target);
   setOptedOut(false);
-  return true;
+  return 0;
+}
+
+// Shown by the installed copy right after installing, since nothing else is visible.
+static void markJustInstalled(bool set) {
+  wchar_t path[MAX_PATH];
+  if (!dataFile(path, L"just-installed")) return;
+  if (set) writeUtf16(path, L"");
+  else DeleteFileW(path);
+}
+
+static bool justInstalled(void) {
+  wchar_t path[MAX_PATH];
+  return dataFile(path, L"just-installed") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
 static bool startTask(void) { return runHidden(L"/run /tn " TASK_NAME) == 0; }
 
 static void toggleAutostart(void) {
   if (gAutostart) {
-    if (runElevated(L"--uninstall")) {
+    if (runElevated(L"--uninstall") == 0) {
       setMarker(NULL);
       setOptedOut(true);
       gAutostart = false;
     }
     return;
   }
-  if (!installViaUac()) return;
+  if (installViaUac() != 0) return;
   gAutostart = true;
-  if (!isElevated()) {  // switch over to the admin instance right away
+  if (!isElevated() || !isInstalledCopy()) {  // switch over to the installed admin copy
     if (gCurveDirty) curveSave();
     if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }
     if (startTask()) quit();
@@ -1410,6 +1483,14 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     default:
       if (msg == gTaskbarCreated && gTaskbarCreated) { trayAdd(); return 0; }  // Explorer restarted
+      if (msg == gQuitMsg && gQuitMsg) {  // a newer copy is being installed
+#ifndef TFD_DEBUG
+        quit();
+#else
+        DestroyWindow(gWnd);
+#endif
+        return 0;
+      }
   }
   return DefWindowProcW(w, msg, wp, lp);
 }
@@ -1428,7 +1509,8 @@ static int run(void) {
 #ifndef TFD_DEBUG
   int argc = 0;
   LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  if (argv && argc >= 2 && wcscmp(argv[1], L"--install") == 0) return installTask(argc >= 3 ? argv[2] : NULL);
+  if (argv && argc >= 2 && wcscmp(argv[1], L"--install") == 0)
+    return installTask(argc >= 3 ? argv[2] : NULL, argc >= 4 ? wcstoul(argv[3], NULL, 10) : 0);
   if (argv && argc >= 2 && wcscmp(argv[1], L"--uninstall") == 0) return uninstallTask();
 #endif
 
@@ -1442,6 +1524,27 @@ static int run(void) {
     return 0;
   }
   migrateOldData();
+  gQuitMsg = RegisterWindowMessageW(L"MacifyQuit");
+
+#ifndef TFD_DEBUG
+  // Started from anywhere but Program Files (a download, a fresh build): install or update.
+  // Also when the installed copy finds its startup task missing.
+  if (!isElevated() && !autostartOptedOut() && !(isInstalledCopy() && autostartInstalled())) {
+    int result = installViaUac();
+    if (result == 0) {
+      markJustInstalled(true);
+      if (startTask()) return 0;
+      markJustInstalled(false);
+    } else if (result == -1) {
+      setOptedOut(true);  // UAC declined: run from here without installing, and don't ask again
+    } else {
+      MessageBoxW(NULL, L"Macify couldn't be installed in Program Files.\n\n"
+                        L"If it is running, quit it from its tray icon, then run this again.",
+                  L"Macify", MB_OK | MB_ICONWARNING);
+      return 0;
+    }
+  }
+#endif
 
   HANDLE mutex = CreateMutexW(NULL, TRUE, L"Local\\Macify");
   gMutex = mutex;
@@ -1456,20 +1559,13 @@ static int run(void) {
   }
 
 #ifndef TFD_DEBUG
-  ensureStartMenuShortcut();
   gAutostart = autostartInstalled();
-  if (!isElevated()) {
-    bool handOff = gAutostart;
-    if (!handOff && !autostartOptedOut()) {  // first run (or the exe moved): one UAC prompt
-      handOff = gAutostart = installViaUac();
-      if (!handOff) setOptedOut(true);
-    }
-    if (handOff) {
-      if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }  // let the admin instance take over
-      if (startTask()) return 0;
-      // couldn't start the task: carry on without admin rights
-    }
+  if (!isElevated() && gAutostart && isInstalledCopy()) {  // e.g. started from the Start menu
+    if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }    // let the admin instance take over
+    if (startTask()) return 0;
+    // couldn't start the task: carry on without admin rights
   }
+  ensureStartMenuShortcut();
 #endif
 
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1493,6 +1589,7 @@ static int run(void) {
   ChangeWindowMessageFilterEx(gWnd, WM_TRAY, MSGFLT_ALLOW, NULL);
   ChangeWindowMessageFilterEx(gWnd, gTaskbarCreated, MSGFLT_ALLOW, NULL);
   ChangeWindowMessageFilterEx(gWnd, WM_COMMAND, MSGFLT_ALLOW, NULL);
+  ChangeWindowMessageFilterEx(gWnd, gQuitMsg, MSGFLT_ALLOW, NULL);
 
   RAWINPUTDEVICE rid = { PAGE_DIGITIZER, USAGE_TOUCHPAD, RIDEV_INPUTSINK, gWnd };
   if (!RegisterRawInputDevices(&rid, 1, sizeof rid)) {
@@ -1508,6 +1605,17 @@ static int run(void) {
   SetTimer(gWnd, TIMER_SAVE, SAVE_INTERVAL_MS, NULL);
   gIcon = makeIcon();
   trayAdd();
+#ifndef TFD_DEBUG
+  if (justInstalled()) {
+    markJustInstalled(false);
+    gNid.uFlags |= NIF_INFO;
+    wcscpy(gNid.szInfoTitle, L"Macify is installed and running");
+    wcscpy(gNid.szInfo, L"It starts with Windows from now on. Its menu is behind this icon in the system tray.");
+    gNid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &gNid);
+    gNid.uFlags &= ~NIF_INFO;
+  }
+#endif
 
   MSG m;
   while (GetMessageW(&m, NULL, 0, 0) > 0) {

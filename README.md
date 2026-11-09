@@ -49,18 +49,27 @@ held, the way AutoHotkey hotkeys do.
 
 1. In **Settings → Bluetooth & devices → Touchpad**, set three-finger swipes and taps to
    **Nothing**, and turn off **Tap twice and drag to multi-select**.
-2. Put `macify.exe` in `C:\Program Files\Macify`. It runs with admin rights at login, so
-   it should live where only admins can replace it.
-3. Run it and accept the UAC prompt. Macify registers a scheduled task (`Macify`) that
-   starts it with admin rights at every login, without further prompts, so it also works
-   in admin windows. It also adds a **Macify** Start menu shortcut.
+2. Run `macify.exe` from wherever you downloaded it and accept the UAC prompt. Macify
+   copies itself to `C:\Program Files\Macify` (it runs with admin rights at login, so it
+   lives where only admins can replace it), registers a scheduled task (`Macify`) that
+   starts it with admin rights at every login without further prompts, adds a **Macify**
+   Start menu shortcut, and starts. A notification confirms it's running.
+
+If you decline the UAC prompt, Macify runs from where it is, without admin rights, and
+doesn't ask again; tray icon → **Start with Windows as administrator** installs it later.
 
 Built for Windows 10/11 with a Precision Touchpad.
+
+## Updating
+
+Run the new `macify.exe` the same way. After the UAC prompt it closes the running copy,
+replaces the one in Program Files and starts it. Settings and the learned pointer speed
+are kept. The debug build never installs.
 
 ## Uninstall
 
 1. Tray icon → untick **Start with Windows as administrator**, then **Quit**.
-2. Delete the program folder, `%APPDATA%\Macify` and the Start menu shortcut
+2. Delete `C:\Program Files\Macify`, `%APPDATA%\Macify` and the Start menu shortcut
    (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Macify.lnk`).
 
 ## Building
