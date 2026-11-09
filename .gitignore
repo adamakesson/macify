@@ -1,0 +1,7 @@
+# build output
+*.exe
+*.o
+
+# icon previews
+icon-preview*.png
+__pycache__/
