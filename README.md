@@ -126,7 +126,7 @@ runAtStartup: true
 runAsAdministrator: true
 checkForUpdatesOnStart: true
 threeFingerDragSpeed: 1.0
-threeFingerDragJumpThreshold: 3
+threeFingerDragJumpThreshold: 0
 keyRemaps:
   Ctrl+D: Delete
   # ... the other key remaps
@@ -141,7 +141,7 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
 | `checkForUpdatesOnStart` | Shortly after Macify starts, check here for a newer version. If there is one, it's downloaded in the background and a notification offers it: click it, or choose **Install Macify …** in the tray menu. Silent when there's nothing new |
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
-| `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` turns it off, for touchpads that don't do this |
+| `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` (the default) turns it off; if your cursor jumps when you start a drag fast, try `3` |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
 
 ## Debug mode

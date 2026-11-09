@@ -229,7 +229,7 @@ static bool gRunAtStartup = true;  // settings.yaml: runAtStartup
 static bool gRunAsAdmin = true;    // settings.yaml: runAsAdministrator
 static bool gCheckUpdates = true;  // settings.yaml: checkForUpdatesOnStart
 static double gSpeedMul = 1.0;     // settings.yaml: threeFingerDragSpeed
-static double gJumpMm = 3.0;       // settings.yaml: threeFingerDragJumpThreshold (0: no filter)
+static double gJumpMm = 0;         // settings.yaml: threeFingerDragJumpThreshold (0: no filter)
 static int gLastScan = -1;
 static bool gVelValid, gHolding;
 static double gVx, gVy;  // trusted finger velocity, mm/ms
@@ -2231,7 +2231,8 @@ static const char kHelpJump[] =
   "# Some touchpads briefly report a much bigger movement than the real one, mostly when a\n"
   "# drag starts fast, which makes the cursor jump. A sudden change of more than this many mm\n"
   "# between two touchpad reports is held back until it's clear whether it was real. It never\n"
-  "# limits how fast you can drag. 0 turns this off (for touchpads that don't do this).\n";
+  "# limits how fast you can drag. 0 (the default) turns this off. If your cursor jumps when\n"
+  "# you start a drag fast, try 3.\n";
 static const char kHelpRemaps[] =
   "# Key remaps, one indented line each:  keys you press: keys sent instead\n"
   "#   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
@@ -2374,7 +2375,7 @@ static void settingsApply(Settings *st, bool userEdit) {
     if (missing & FOUND_UPDATES)
       settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Multiplies the three-finger drag speed");
     if (missing & FOUND_JUMP)
-      settingsInsertLine(kHelpJump, "threeFingerDragJumpThreshold: 3", "# Key remaps");
+      settingsInsertLine(kHelpJump, "threeFingerDragJumpThreshold: 0", "# Key remaps");
   } else if (st->found != FOUND_ALL) {
     settingsWrite();
   }
@@ -2395,7 +2396,7 @@ static void settingsDefaults(Settings *st) {
   memset(st, 0, sizeof *st);
   st->runAtStartup = st->runAsAdmin = st->checkUpdates = true;  // for anything the file leaves out
   st->speed = 1.0;
-  st->jump = 3.0;
+  st->jump = 0;  // off: only some touchpads need it
 }
 
 static size_t readSmallFile(const wchar_t *path, char *text, size_t size) {
