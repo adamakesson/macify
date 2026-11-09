@@ -1337,14 +1337,12 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_STRING | (gRunAtStartup ? MF_CHECKED : 0), ID_STARTUP, L"Run at startup");
   AppendMenuW(menu, MF_STRING | (gRunAsAdmin ? MF_CHECKED : 0), ID_ADMIN, L"Run as administrator");
   AppendMenuW(menu, MF_STRING | (gCheckUpdates ? MF_CHECKED : 0), ID_AUTOUPDATE, L"Check for updates on start");
-  AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
   AppendMenuW(menu, MF_STRING | (gUpdateBusy ? MF_GRAYED : 0), ID_UPDATE,
               gPendingTag[0] ? install : gUpdateBusy ? L"Checking for updates..." : L"Check for updates");
-  AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);      // pointer speed
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
-  AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug mode (save log to desktop)" : L"Start debug mode");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit");
