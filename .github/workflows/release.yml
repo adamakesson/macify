@@ -1,0 +1,60 @@
+# Publishes a GitHub release whenever the version in version.h changes:
+# builds macify.exe from the source and attaches it to release v<version>.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [version.h]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # history and tags, for the release notes
+
+      - name: Read version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(sed -n 's/^#define MACIFY_VERSION_STR "\(.*\)"/\1/p' version.h)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" > /dev/null 2>&1; then
+            echo "Release v$v already exists, nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.version.outputs.exists != 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-mingw-w64-x86-64
+          sh build.sh
+
+      - name: Publish release
+        if: steps.version.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          previous=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          {
+            echo "## Changes"
+            echo
+            git log ${previous:+$previous..}HEAD --no-merges --format='- %s'
+            echo
+            echo "## Install or update"
+            echo
+            echo 'Already using Macify: tray icon → **Check for updates**.'
+            echo
+            echo 'New install: download `macify.exe`, run it and accept the UAC prompt. It installs itself in `C:\Program Files\Macify` and starts with Windows. Before the first drag, set three-finger swipes and taps to **Nothing** and turn off **Tap twice and drag to multi-select** in Settings → Bluetooth & devices → Touchpad.'
+          } > notes.md
+          gh release create "v$VERSION" macify.exe \
+            --title "Macify $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
