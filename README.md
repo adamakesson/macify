@@ -56,7 +56,7 @@ log and quit.
 | Ctrl+H | Win+M (minimise all) |
 | Ctrl+I | Ctrl+Shift+C |
 | Ctrl+Shift+7 | Alt+Shift+A |
-| Left Alt+W | Windows key (opens Start) |
+| Left Alt+W | Windows key, held for as long as W is: alone it opens Start, with other keys it makes Windows-key shortcuts (Alt+W+E: File Explorer) |
 | Ctrl+click or Alt+click | right-click (physical Ctrl key only; Win+click stays Ctrl+click) |
 
 "Ctrl" includes the left Win key. Each shortcut fires only with exactly those modifiers

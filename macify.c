@@ -33,7 +33,8 @@
 // Keyboard and mouse remaps (replace an AutoHotkey script; see "remaps" below):
 //   Left Win acts as Ctrl. Ctrl+D / Ctrl+Backspace = Delete. Ctrl+2/3/4/7/8/9/0 and
 //   Ctrl+< / Ctrl+´ = the AltGr symbol on that key. Ctrl+H = Win+M. Ctrl+I = Ctrl+Shift+C.
-//   Ctrl+Shift+7 = Alt+Shift+A. Left Alt+W = the Windows key (Start).
+//   Ctrl+Shift+7 = Alt+Shift+A. Left Alt+W = the Windows key, held while W is held
+//   (alone: Start; with other keys: Windows-key shortcuts).
 //   Physical Ctrl or Alt + click = plain right-click, and a
 //   three-finger drag started with Ctrl or Alt held is a right-button drag.
 //
@@ -847,6 +848,7 @@ static bool kLog[256];       // modifier state as Windows currently sees it
 static bool kSup[256];       // modifiers hidden from apps for a remapped click, until released
 static bool kSwallowUp[256]; // hotkey keys whose release must be swallowed too
 static bool gClickRemapped;
+static bool gWinFromW;       // left Alt+W is being held as the Windows key
 
 static bool isMod(UINT vk) {
   for (size_t i = 0; i < N_MODS; i++) if (kMods[i] == vk) return true;
@@ -947,15 +949,6 @@ static bool runHotkey(UINT vk) {
   bool alt = kLog[VK_LMENU] || kLog[VK_RMENU];
   bool shift = kLog[VK_LSHIFT] || kLog[VK_RSHIFT];
   bool win = kLog[VK_LWIN] || kLog[VK_RWIN];
-  // Left Alt+W: a tap of the Windows key (opens Start). Alt is hidden for the rest of the
-  // press, so releasing it can't activate a menu bar. Right Alt is AltGr: left alone.
-  if (vk == 'W' && kLog[VK_LMENU] && !kLog[VK_RMENU] && !ctrl && !shift && !win) {
-    const UINT alts[] = { VK_LMENU };
-    hideModifiers(alts, 1);
-    sendKey(VK_LWIN, true);
-    sendKey(VK_LWIN, false);
-    return true;
-  }
   if (!ctrl || alt || win) return false;  // like AutoHotkey: exactly these modifiers
 
   UINT lessVk = charVk(L'<', VK_OEM_102), acuteVk = charVk(L'´', VK_OEM_4);
@@ -1012,11 +1005,27 @@ static LRESULT CALLBACK keyboardHook(int code, WPARAM wp, LPARAM lp) {
 
   if (!down) {
     kPhys[vk] = false;
+    if (vk == 'W' && gWinFromW) { gWinFromW = false; sendKey(VK_LWIN, false); return 1; }
     if (kSwallowUp[vk]) { kSwallowUp[vk] = false; return 1; }
     return CallNextHookEx(NULL, code, wp, lp);
   }
   kPhys[vk] = true;
-  bool restored = restoreHidden();
+
+  // Left Alt+W is the Windows key, held for as long as W is: alone it opens Start, with
+  // other keys it makes Windows-key combinations. Alt is hidden meanwhile (and pressed
+  // again if a later key needs it). Right Alt is AltGr: left alone.
+  if (vk == 'W' && gWinFromW) return 1;  // auto-repeat
+  if (vk == 'W' && kLog[VK_LMENU] && !kLog[VK_RMENU] && !kLog[VK_LCONTROL] && !kLog[VK_RCONTROL] &&
+      !kLog[VK_LSHIFT] && !kLog[VK_RSHIFT] && !kLog[VK_LWIN] && !kLog[VK_RWIN]) {
+    const UINT alts[] = { VK_LMENU };
+    hideModifiers(alts, 1);
+    sendKey(VK_LWIN, true);
+    gWinFromW = true;
+    LOG("Alt+W: Windows key down\n");
+    return 1;
+  }
+
+  bool restored = gWinFromW ? false : restoreHidden();  // keep Alt hidden while Win is held
   if (runHotkey(vk)) { kSwallowUp[vk] = true; LOG("hotkey vk %02X\n", vk); return 1; }
   if (restored) { replayKey(kb); return 1; }
   return CallNextHookEx(NULL, code, wp, lp);
@@ -1049,7 +1058,7 @@ static LRESULT CALLBACK remapMouseHook(int code, WPARAM wp, LPARAM lp) {
     return 1;
   }
   // Anything else that may need the hidden modifiers (Ctrl+scroll to zoom, etc.)
-  if (wp != WM_LBUTTONDOWN && wp != WM_LBUTTONUP && restoreHidden()) {
+  if (wp != WM_LBUTTONDOWN && wp != WM_LBUTTONUP && !gWinFromW && restoreHidden()) {
     DWORD data = HIWORD(m->mouseData);
     switch (wp) {
       case WM_MOUSEWHEEL:  sendMouse(MOUSEEVENTF_WHEEL, (DWORD)(LONG)(SHORT)data); break;
