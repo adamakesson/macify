@@ -15,17 +15,13 @@
 // started without admin rights while that task exists, it starts the task instead, so
 // there is never another prompt. Turn it on/off from the tray menu.
 //
-// How the drag is computed (the part that differs from ThreeFingerDragOnWindows):
-//   - Every contact is tracked by its contact ID between frames. The cursor moves by
-//     the AVERAGE movement of the fingers that were on the pad in both frames, i.e. the
-//     movement of the group's centre. Moving one finger alone moves the cursor 1/3 as far.
-//   - Fingers are paired between frames by position, not by the touchpad's contact IDs.
+// How the drag is computed:
+//   - The cursor follows whichever finger moved the most since the previous touchpad
+//     report, like ThreeFingerDragOnWindows.
+//   - Fingers are paired between reports by position, not by the touchpad's contact IDs.
 //   - When a finger lands or lifts, movement is ignored for SETTLE_MS: many touchpads
 //     report fingers side by side as one blob and then split it, which would otherwise
 //     look like a huge, instant movement.
-//   - A finger that suddenly moves very differently from the others in one frame is
-//     left out (sensor artefact). A real drag moves all fingers together, so this never
-//     limits speed.
 //   - Some touchpads briefly report several times the real movement for all fingers
 //     (seen when three fingers start moving sideways). A real hand can't change speed
 //     that abruptly, so such a jump is held back for up to SPIKE_HOLD_MS: if it snaps
@@ -48,10 +44,6 @@
 //   "runAtStartup": true                start Macify when you log in
 //   "runAsAdministrator": true          run with admin rights (so it also works in admin
 //                                       windows) via a scheduled task, without prompts
-//   "threeFingerDragAsOneFinger": true  true: the fingers move the cursor together, as
-//                                       one (their centre, like macOS); false: the cursor
-//                                       follows whichever finger moves the most, like
-//                                       ThreeFingerDragOnWindows
 //   "threeFingerDragSpeed": 1.0         multiplies the three-finger drag speed
 //
 // Pointer speed is learned, not configured: while you use one finger normally, the app
@@ -98,7 +90,6 @@
 #define ACCEL_LOW_MM_PER_S        20.0   // below this speed: MIN_GAIN
 #define ACCEL_HIGH_MM_PER_S       260.0  // above this speed: MAX_GAIN
 #define SETTLE_MS                 30.0   // ignore movement this long after a finger lands or lifts
-#define OUTLIER_MM                3.0    // per-frame disagreement with the other fingers that marks an artefact
 #define MAX_ACCEL_MM_PER_MS2      0.04   // speed change no real hand makes within one frame (40 m/s^2)
 #define SPIKE_HOLD_MS             80.0   // how long a sudden jump is held back before it is trusted
 #define USE_PALM_REJECTION        true   // ignore contacts the touchpad marks as not confident
@@ -220,7 +211,6 @@ static bool gCurveDirty;
 static int gSettingsSig[3];
 static double gDragSpeed;
 static double gSettleUntilMs;
-static bool gAsOneFinger = true;   // settings.json: threeFingerDragAsOneFinger
 static bool gRunAtStartup = true;  // settings.json: runAtStartup
 static bool gRunAsAdmin = true;    // settings.json: runAsAdministrator
 static double gSpeedMul = 1.0;     // settings.json: threeFingerDragSpeed
@@ -637,12 +627,6 @@ static void pairContacts(const Contact *a, const Contact *b, int n, int *perm) {
   }
 }
 
-static double median(double *v, int n) {
-  for (int i = 1; i < n; i++)
-    for (int j = i; j > 0 && v[j - 1] > v[j]; j--) { double t = v[j]; v[j] = v[j - 1]; v[j - 1] = t; }
-  return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
-}
-
 static bool sameFingers(const Contact *a, int na, const Contact *b, int nb) {
   if (na != nb) return false;
   for (int i = 0; i < na; i++) {
@@ -714,40 +698,18 @@ static void processFrame(const Contact *all, int n, int scanTime) {
   }
   bool settling = nowMs < gSettleUntilMs;
 
-  // threeFingerDragAsOneFinger: movement of the group's centre (average of each finger's
-  // movement). Otherwise the movement of the finger that moved most.
+  // The movement of the finger that moved most.
   double dx = 0, dy = 0;
   int used = 0;
   if (!settling && count > 0 && count == gPrevCount) {
     int perm[MAX_CONTACTS];
-    double fx[MAX_CONTACTS], fy[MAX_CONTACTS], sx[MAX_CONTACTS], sy[MAX_CONTACTS];
+    double best = -1;
     pairContacts(active, gPrev, count, perm);
     for (int i = 0; i < count; i++) {
-      fx[i] = sx[i] = active[i].x - gPrev[perm[i]].x;
-      fy[i] = sy[i] = active[i].y - gPrev[perm[i]].y;
+      double fx = active[i].x - gPrev[perm[i]].x, fy = active[i].y - gPrev[perm[i]].y;
+      if (hypot(fx, fy) > best) { best = hypot(fx, fy); dx = fx; dy = fy; }
     }
-    if (!gAsOneFinger) {
-      double best = -1;
-      for (int i = 0; i < count; i++)
-        if (hypot(fx[i], fy[i]) > best) { best = hypot(fx[i], fy[i]); dx = fx[i]; dy = fy[i]; }
-      used = count;
-    }
-    double mx = 0, my = 0, limit = INFINITY;
-    if (gAsOneFinger && count >= 3) {  // with three or more fingers the median tells us what the hand did
-      mx = median(sx, count);
-      my = median(sy, count);
-      limit = OUTLIER_MM + 0.5 * hypot(mx, my);
-    }
-    for (int i = 0; i < count && gAsOneFinger; i++) {
-      if (hypot(fx[i] - mx, fy[i] - my) > limit) {
-        LOG("ignored finger moving %.1fmm against the others\n", hypot(fx[i] - mx, fy[i] - my));
-        continue;
-      }
-      dx += fx[i];
-      dy += fy[i];
-      used++;
-    }
-    if (used && gAsOneFinger) { dx /= used; dy /= used; }
+    used = count;
   }
   if (used && count == DRAG_FINGERS && (gState == ARMED || gState == DRAGGING)) {
     double rx = dx, ry = dy;
@@ -1710,8 +1672,8 @@ static void logState(void) {
   for (int b = 0; b < LEARN_BINS; b++)
     if (gBinMm[b] > 0)
       LOG("  %6.1f mm/s: %6.2f px/mm from %.0f mm of movement\n", binSpeed(b), gBinPx[b] / gBinMm[b], gBinMm[b]);
-  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragAsOneFinger %d, threeFingerDragSpeed %.2f\n",
-      gRunAtStartup, gRunAsAdmin, gAsOneFinger, gSpeedMul);
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f\n",
+      gRunAtStartup, gRunAsAdmin, gSpeedMul);
   LOG("--- events ---\n");
 }
 
@@ -1765,12 +1727,12 @@ static void debugFinish(void) {
 
 #define FOUND_STARTUP 1
 #define FOUND_ADMIN   2
-#define FOUND_ASONE   4
-#define FOUND_SPEED   8
-#define FOUND_ALL     15
+#define FOUND_SPEED   4
+#define FOUND_ALL     7
+#define FOUND_OBSOLETE 8  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
-  bool runAtStartup, runAsAdmin, asOneFinger;
+  bool runAtStartup, runAsAdmin;
   double speed;
   int found;  // which settings the file had: FOUND_* bits
 } Settings;
@@ -1839,10 +1801,9 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
     jsonSkip(&j);
     int line = jsonLine(&j);
     int bit = strcmp(key, "runAtStartup") == 0 ? FOUND_STARTUP
-            : strcmp(key, "runAsAdministrator") == 0 ? FOUND_ADMIN
-            : strcmp(key, "threeFingerDragAsOneFinger") == 0 ? FOUND_ASONE : 0;
-    bool *flag = bit == FOUND_STARTUP ? &st->runAtStartup : bit == FOUND_ADMIN ? &st->runAsAdmin
-               : bit == FOUND_ASONE ? &st->asOneFinger : NULL;
+            : strcmp(key, "runAsAdministrator") == 0 ? FOUND_ADMIN : 0;
+    bool *flag = bit == FOUND_STARTUP ? &st->runAtStartup : bit == FOUND_ADMIN ? &st->runAsAdmin : NULL;
+    if (strcmp(key, "threeFingerDragAsOneFinger") == 0) st->found |= FOUND_OBSOLETE;  // removed in 1.7
     if (flag) {
       if (!jsonBool(&j, flag)) { snprintf(err, errLen, "\"%s\" must be true or false (line %d)", key, line); return false; }
       st->found |= bit;
@@ -1884,10 +1845,9 @@ static void settingsWrite(void) {
   fprintf(f, "{\n"
              "  \"runAtStartup\": %s,\n"
              "  \"runAsAdministrator\": %s,\n"
-             "  \"threeFingerDragAsOneFinger\": %s,\n"
              "  \"threeFingerDragSpeed\": %s\n"
              "}\n",
-          gRunAtStartup ? "true" : "false", gRunAsAdmin ? "true" : "false", gAsOneFinger ? "true" : "false", speed);
+          gRunAtStartup ? "true" : "false", gRunAsAdmin ? "true" : "false", speed);
   fclose(f);
   WIN32_FILE_ATTRIBUTE_DATA a;  // our own write: not a change to react to
   if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) gSettingsTime = a.ftLastWriteTime;
@@ -1911,7 +1871,7 @@ static void settingsLoad(bool userEdit) {
   text[n] = 0;
   if (n == 0 && userEdit) return;  // editors sometimes truncate before writing: wait for the real save
 
-  Settings st = { true, true, true, 1.0, 0 };  // defaults for anything the file leaves out
+  Settings st = { true, true, 1.0, 0 };  // defaults for anything the file leaves out
   char err[160];
   if (!parseSettings(text, &st, err, sizeof err)) {
     LOG("settings.json not applied: %s\n", err);
@@ -1919,22 +1879,17 @@ static void settingsLoad(bool userEdit) {
     if (gWnd) { trayNotify(L"Macify settings not applied", gSettingsError); gSettingsError[0] = 0; }
     return;
   }
-  // Until 1.5, threeFingerDragAsOneFinger meant the opposite (true: follow the finger that
-  // moves most). Those files don't have the startup settings yet: keep their behaviour.
-  if ((st.found & FOUND_ASONE) && !(st.found & (FOUND_STARTUP | FOUND_ADMIN))) st.asOneFinger = !st.asOneFinger;
-  bool dragChanged = st.asOneFinger != gAsOneFinger || st.speed != gSpeedMul;
+  bool dragChanged = st.speed != gSpeedMul;
   bool startupChanged = st.runAtStartup != gRunAtStartup || st.runAsAdmin != gRunAsAdmin;
   gRunAtStartup = st.runAtStartup;
   gRunAsAdmin = st.runAsAdmin;
-  gAsOneFinger = st.asOneFinger;
   gSpeedMul = st.speed;
-  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragAsOneFinger %d, threeFingerDragSpeed %.2f\n",
-      gRunAtStartup, gRunAsAdmin, gAsOneFinger, gSpeedMul);
-  if (st.found != FOUND_ALL) settingsWrite();  // from an older version: add the missing settings
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f\n",
+      gRunAtStartup, gRunAsAdmin, gSpeedMul);
+  if (st.found != FOUND_ALL) settingsWrite();  // from an older version: add missing settings, drop removed ones
   if (userEdit && dragChanged) {
     wchar_t msg[160];
-    _snwprintf(msg, 160, L"Three-finger drag follows %ls, speed %.2fx.",
-               gAsOneFinger ? L"the centre of the fingers" : L"the finger that moves most", gSpeedMul);
+    _snwprintf(msg, 160, L"Three-finger drag speed: %.2fx.", gSpeedMul);
     trayNotify(L"Macify settings applied", msg);
   }
   if (userEdit && startupChanged && gWnd) applyStartup();

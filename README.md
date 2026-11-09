@@ -27,8 +27,7 @@ log and quit.
 
 ## Three-finger drag
 
-- The cursor follows the **centre of the three fingers**: every finger is tracked, and the
-  cursor moves by their average movement.
+- The cursor follows **whichever finger moves the most**, like ThreeFingerDragOnWindows.
 - **Pointer speed matches Windows exactly.** While you use one finger normally, Macify
   compares your finger's movement with how far Windows moves the cursor and learns
   Windows' speed curve from that. The curve is saved in `%APPDATA%\Macify\speed-curve.txt`
@@ -82,7 +81,6 @@ startup options can also be switched from the tray menu, which updates the file.
 {
   "runAtStartup": true,
   "runAsAdministrator": true,
-  "threeFingerDragAsOneFinger": true,
   "threeFingerDragSpeed": 1.0
 }
 ```
@@ -91,7 +89,6 @@ startup options can also be switched from the tray menu, which updates the file.
 |---|---|
 | `runAtStartup` | Start Macify when you log in |
 | `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
-| `threeFingerDragAsOneFinger` | `true` (default): the fingers move the cursor together, as one (their centre), like macOS. `false`: the cursor follows whichever finger moves most, like ThreeFingerDragOnWindows |
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
 
 ## Debug log
