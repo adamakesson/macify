@@ -81,24 +81,22 @@ Built for Windows 10/11 with a Precision Touchpad.
 
 ## Settings
 
-Tray icon → **Edit settings** opens `%APPDATA%\Macify\settings.json`. Changes apply as
+Tray icon → **Edit settings** opens `%APPDATA%\Macify\settings.yaml`. Changes apply as
 soon as you save; a notification confirms them, or says what's wrong with the file. The
 startup options can also be switched from the tray menu, which updates the file.
 
-```jsonc
-{
-  "runAtStartup": true,
-  "runAsAdministrator": true,
-  "threeFingerDragSpeed": 1.0,
-  "keyRemaps": {
-    "Ctrl+D": "Delete",
-    // ... the shortcuts from the Keyboard table
-  }
-}
+```yaml
+runAtStartup: true
+runAsAdministrator: true
+threeFingerDragSpeed: 1.0
+keyRemaps:
+  Ctrl+D: Delete
+  Ctrl+H: Win+M
+  # ... the other shortcuts from the Keyboard table
 ```
 
-The file starts with a comment explaining every setting. Macify accepts `//` comments in
-it (some editors underline them, since plain JSON has no comments).
+The file starts with a comment explaining every setting. (Versions up to 1.8 used
+`settings.json`; it's converted to `settings.yaml` automatically, keeping its values.)
 
 | Setting | Meaning |
 |---|---|
@@ -109,20 +107,22 @@ it (some editors underline them, since plain JSON has no comments).
 
 ### Key remaps
 
-Each entry is `"keys you press": "keys sent instead"`, for example `"Ctrl+H": "Win+M"`.
+Each entry is an indented line under `keyRemaps:`, `keys you press: keys sent instead`,
+for example `Ctrl+H: Win+M`.
 
 - Keys are written as modifiers joined with `+`, then one key: `Ctrl+Shift+7`.
 - Modifiers: `Ctrl`, `Alt`, `Shift`, `Win`.
 - Keys: `A`–`Z`, `0`–`9`, `F1`–`F24`, `Delete`, `Backspace`, `Enter`, `Tab`, `Esc`,
   `Space`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`,
   `PrintScreen`, or a character that has its own key on your keyboard layout, like `<`
-  or `´` (the `+` key is written `Ctrl++`).
+  or `´` (the `+` key is written `Ctrl++`). Keys containing `#` or `:` need quotes:
+  `"Ctrl+#": Delete`.
 - In the keys you press, `Ctrl` also means the left Windows key, and `Win` can't be used.
   `Alt+W` is reserved for the Windows key.
 - A remap only fires with exactly those modifiers held: `Ctrl+D` doesn't fire for
   Ctrl+Shift+D. Modifiers that aren't part of the keys sent are released for that moment.
 - An entry with a mistake is skipped, with a notification saying why; the others still
-  work. Remove `keyRemaps` to get the defaults back; `"keyRemaps": {}` turns them all off.
+  work. Remove `keyRemaps` to get the defaults back; `keyRemaps: {}` turns them all off.
 
 ## Debug log
 

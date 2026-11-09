@@ -41,7 +41,7 @@
 // Earlier versions were called three-finger-drag: their settings, startup task and
 // Start menu shortcut are taken over automatically.
 //
-// Settings file: %APPDATA%\Macify\settings.json (tray menu > Edit settings), created
+// Settings file: %APPDATA%\Macify\settings.yaml (tray menu > Edit settings), created
 // with the defaults, picked up as soon as it is saved:
 //   "runAtStartup": true                start Macify when you log in
 //   "runAsAdministrator": true          run with admin rights (so it also works in admin
@@ -67,6 +67,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <winhttp.h>
 #include <shlobj.h>
 #include <objbase.h>
@@ -214,9 +215,9 @@ static bool gCurveDirty;
 static int gSettingsSig[3];
 static double gDragSpeed;
 static double gSettleUntilMs;
-static bool gRunAtStartup = true;  // settings.json: runAtStartup
-static bool gRunAsAdmin = true;    // settings.json: runAsAdministrator
-static double gSpeedMul = 1.0;     // settings.json: threeFingerDragSpeed
+static bool gRunAtStartup = true;  // settings.yaml: runAtStartup
+static bool gRunAsAdmin = true;    // settings.yaml: runAsAdministrator
+static double gSpeedMul = 1.0;     // settings.yaml: threeFingerDragSpeed
 static int gLastScan = -1;
 static bool gVelValid, gHolding;
 static double gVx, gVy;  // trusted finger velocity, mm/ms
@@ -837,7 +838,7 @@ static void onRawInput(HRAWINPUT h) {
 
 // ---------------------------------------------------------------- key remap table
 //
-// Filled from the "keyRemaps" section of settings.json (defaults below), read by the
+// Filled from the "keyRemaps" section of settings.yaml (defaults below), read by the
 // keyboard hook. Written as text like "Ctrl+Shift+7": modifiers, then one key.
 
 #define KM_CTRL  1
@@ -1583,7 +1584,7 @@ static int registerTask(const wchar_t *exe, const wchar_t *dir, bool startup, co
   return code == 0 ? 0 : 1;
 }
 
-// Needs admin rights: makes the task match settings.json for the installed copy.
+// Needs admin rights: makes the task match settings.yaml for the installed copy.
 static int configureTask(const wchar_t *user) {
   wchar_t target[MAX_PATH], targetDir[MAX_PATH];
   if (!installedPath(target, targetDir)) return 1;
@@ -1592,7 +1593,7 @@ static int configureTask(const wchar_t *user) {
 }
 
 // Runs elevated (--install): copies this exe to Program Files (closing the running copy,
-// which keeps it locked) and sets up the task as settings.json says.
+// which keeps it locked) and sets up the task as settings.yaml says.
 static int installTask(const wchar_t *user, DWORD callerPid) {
   wchar_t exe[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], targetDir[MAX_PATH], stream[MAX_PATH + 20];
   if (!exePath(exe, dir) || !installedPath(target, targetDir)) return 1;
@@ -1684,7 +1685,7 @@ static void launchAsUser(const wchar_t *exe) {
   ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
 }
 
-// Starts the installed copy the way settings.json says: through the task (admin rights,
+// Starts the installed copy the way settings.yaml says: through the task (admin rights,
 // no prompt) or as the user.
 static bool launchInstalled(void) {
   wchar_t target[MAX_PATH], targetDir[MAX_PATH];
@@ -1917,9 +1918,9 @@ static FILETIME gSettingsTime;
 static wchar_t gSettingsError[256];  // a problem found before the tray icon existed
 static HANDLE gSettingsWatch = INVALID_HANDLE_VALUE;
 
-// A small parser for a flat JSON object of booleans, numbers and strings. Comments
-// (// and /* */) are allowed; unknown keys are ignored. On a syntax error, *err says
-// where and false is returned.
+// The settings file was JSON until 1.8. This small JSON parser is kept only to convert
+// such a file to YAML once. Comments (// and /* */) are allowed; unknown keys are
+// ignored. On a syntax error, *err says where and false is returned.
 typedef struct { const char *p, *start; } Json;
 
 static void jsonSkip(Json *j) {
@@ -2033,30 +2034,162 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
   }
 }
 
-static bool settingsPath(wchar_t *path) { return dataFile(path, L"settings.json"); }
+static bool settingsPath(wchar_t *path) { return dataFile(path, L"settings.yaml"); }
+
+// ---- YAML: the subset Macify needs. Top-level "name: value" lines, and "keyRemaps:"
+// followed by indented "keys: keys" lines. # starts a comment (at the start of a line or
+// after a space); values may be "double" or 'single' quoted.
+
+static char *yamlTrim(char *t) {
+  while (*t == ' ' || *t == '\t') t++;
+  char *e = t + strlen(t);
+  while (e > t && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) *--e = 0;
+  return t;
+}
+
+// Cuts off a # comment that isn't inside quotes.
+static void yamlStripComment(char *line) {
+  char quote = 0;
+  for (char *c = line; *c; c++) {
+    if (quote) { if (*c == quote) quote = 0; continue; }
+    if (*c == '"' || *c == '\'') quote = *c;
+    else if (*c == '#' && (c == line || c[-1] == ' ' || c[-1] == '\t')) { *c = 0; return; }
+  }
+}
+
+// Unquotes a scalar into out. false if a quote isn't closed.
+static bool yamlScalar(const char *in, char *out, size_t n) {
+  size_t o = 0;
+  if (*in == '"' || *in == '\'') {
+    char q = *in++;
+    for (; *in; in++) {
+      if (*in == q) {
+        if (q == '\'' && in[1] == '\'') in++;  // '' is a quote inside '...'
+        else { out[o] = 0; return *yamlTrim((char *)in + 1) == 0; }
+      } else if (q == '"' && *in == '\\' && in[1]) in++;
+      if (o + 1 < n) out[o++] = *in;
+    }
+    return false;
+  }
+  snprintf(out, n, "%s", in);
+  return true;
+}
+
+// Splits "key: value" at the first colon (outside quotes) followed by a space or the end.
+static bool yamlSplit(char *line, char **key, char **value) {
+  char quote = 0;
+  for (char *c = line; *c; c++) {
+    if (quote) { if (*c == quote) quote = 0; continue; }
+    if (*c == '"' || *c == '\'') quote = *c;
+    else if (*c == ':' && (c[1] == 0 || c[1] == ' ' || c[1] == '\t')) {
+      *c = 0;
+      *key = yamlTrim(line);
+      *value = yamlTrim(c + 1);
+      return **key != 0;
+    }
+  }
+  return false;
+}
+
+static bool yamlBool(const char *v, bool *out) {
+  if (!_stricmp(v, "true") || !_stricmp(v, "yes") || !_stricmp(v, "on")) { *out = true; return true; }
+  if (!_stricmp(v, "false") || !_stricmp(v, "no") || !_stricmp(v, "off")) { *out = false; return true; }
+  return false;
+}
+
+static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t errLen) {
+  static char buf[8192];
+  snprintf(buf, sizeof buf, "%s", text);
+  bool inRemaps = false;
+  int lineNo = 0;
+  for (char *line = buf, *next; line; line = next) {
+    next = strchr(line, '\n');
+    if (next) *next++ = 0;
+    lineNo++;
+    if (lineNo == 1 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) line += 3;
+    yamlStripComment(line);
+    bool indented = line[0] == ' ' || line[0] == '\t';
+    char *content = yamlTrim(line);
+    if (!*content) continue;
+
+    char *rawKey, *rawValue, key[64], value[64];
+    if (!yamlSplit(content, &rawKey, &rawValue)) {
+      bool openQuote = (content[0] == '"' || content[0] == '\'') && !strchr(content + 1, content[0]);
+      snprintf(err, errLen, openQuote ? "a quote isn't closed on line %d" : "line %d should look like name: value", lineNo);
+      return false;
+    }
+    if (!yamlScalar(rawKey, key, sizeof key) || !yamlScalar(rawValue, value, sizeof value)) {
+      snprintf(err, errLen, "a quote isn't closed on line %d", lineNo);
+      return false;
+    }
+
+    if (indented) {  // an entry under keyRemaps
+      if (!inRemaps) { snprintf(err, errLen, "line %d is indented, but isn't under keyRemaps", lineNo); return false; }
+      char why[160];
+      if (!*value) snprintf(why, sizeof why, "\"%s\": no keys to send", key);
+      if (!*value || !addRemap(st->remaps, &st->remapCount, key, value, why, sizeof why)) {
+        size_t used = strlen(st->skipped);
+        snprintf(st->skipped + used, sizeof st->skipped - used, "%s%s (line %d)", used ? "; " : "", why, lineNo);
+      }
+      continue;
+    }
+
+    inRemaps = false;
+    if (!strcmp(key, "keyRemaps")) {
+      if (*value && strcmp(rawValue, "{}") != 0) {
+        snprintf(err, errLen, "keyRemaps (line %d) should be followed by indented lines like  Ctrl+D: Delete", lineNo);
+        return false;
+      }
+      st->found |= FOUND_REMAPS;
+      st->remapCount = 0;
+      inRemaps = !*value;
+    } else if (!strcmp(key, "runAtStartup") || !strcmp(key, "runAsAdministrator")) {
+      bool *flag = !strcmp(key, "runAtStartup") ? &st->runAtStartup : &st->runAsAdmin;
+      if (!yamlBool(value, flag)) { snprintf(err, errLen, "%s must be true or false (line %d)", key, lineNo); return false; }
+      st->found |= flag == &st->runAtStartup ? FOUND_STARTUP : FOUND_ADMIN;
+    } else if (!strcmp(key, "threeFingerDragSpeed")) {
+      char *end;
+      double v = strtod(value, &end);
+      if (end == value || *end || !(v > 0) || v > 20) {
+        snprintf(err, errLen, "threeFingerDragSpeed must be a number above 0, like 1.0 or 1.5 (line %d)", lineNo);
+        return false;
+      }
+      st->speed = v;
+      st->found |= FOUND_SPEED;
+    } else {
+      LOG("settings: ignoring unknown \"%s\"\n", key);
+    }
+  }
+  return true;
+}
 
 static const char kSettingsHelp[] =
-  "// Macify settings. Changes apply as soon as you save this file.\n"
-  "//\n"
-  "// runAtStartup: start Macify when you log in (true or false).\n"
-  "// runAsAdministrator: run with admin rights, so it also works in admin windows.\n"
-  "// threeFingerDragSpeed: multiplies the three-finger drag speed (1.0 = normal pointer).\n"
-  "//\n"
-  "// keyRemaps: \"keys you press\": \"keys sent instead\"\n"
-  "//   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
-  "//   Modifiers: Ctrl, Alt, Shift, Win\n"
-  "//   Keys: A-Z, 0-9, F1-F24, Delete, Backspace, Enter, Tab, Esc, Space, Left, Right,\n"
-  "//         Up, Down, Home, End, PageUp, PageDown, Insert, PrintScreen, or a character\n"
-  "//         that has its own key on your keyboard layout, like < or ´ (+ is written Ctrl++)\n"
-  "//   In the keys you press, Ctrl also means the left Windows key, and Win can't be used.\n"
-  "//   A remap only happens with exactly those modifiers held: Ctrl+D isn't Ctrl+Shift+D.\n"
-  "//   Delete keyRemaps to get the default remaps back; \"keyRemaps\": {} turns them all off.\n"
-  "//\n"
-  "// Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"
-  "// Windows key, and Ctrl+click or Alt+click is a right-click.\n";
+  "# Macify settings. Changes apply as soon as you save this file.\n"
+  "#\n"
+  "# runAtStartup: start Macify when you log in (true or false).\n"
+  "# runAsAdministrator: run with admin rights, so it also works in admin windows.\n"
+  "# threeFingerDragSpeed: multiplies the three-finger drag speed (1.0 = normal pointer).\n"
+  "#\n"
+  "# keyRemaps: one line per remap, indented: keys you press: keys sent instead\n"
+  "#   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
+  "#   Modifiers: Ctrl, Alt, Shift, Win\n"
+  "#   Keys: A-Z, 0-9, F1-F24, Delete, Backspace, Enter, Tab, Esc, Space, Left, Right,\n"
+  "#         Up, Down, Home, End, PageUp, PageDown, Insert, PrintScreen, or a character\n"
+  "#         that has its own key on your keyboard layout, like < or ´ (+ is written Ctrl++)\n"
+  "#   Keys containing # or : need quotes: \"Ctrl+#\": Delete\n"
+  "#   In the keys you press, Ctrl also means the left Windows key, and Win can't be used.\n"
+  "#   A remap only happens with exactly those modifiers held: Ctrl+D isn't Ctrl+Shift+D.\n"
+  "#   Delete keyRemaps to get the default remaps back; keyRemaps: {} turns them all off.\n"
+  "#\n"
+  "# Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"
+  "# Windows key, and Ctrl+click or Alt+click is a right-click.\n"
+  "\n";
 
-// A JSON string, with " and \ escaped.
-static void jsonPut(FILE *f, const char *text) {
+// Writes a key or value, quoted only if YAML would otherwise misread it.
+static void yamlPut(FILE *f, const char *text) {
+  bool quote = !*text || strchr("-?:,[]{}#&*!|>'\"%@`", text[0]) || strstr(text, ": ") || strstr(text, " #") ||
+               text[strlen(text) - 1] == ':' || text[0] == ' ' || text[strlen(text) - 1] == ' ';
+  if (!quote) { fputs(text, f); return; }
   fputc('"', f);
   for (; *text; text++) {
     if (*text == '"' || *text == '\\') fputc('\\', f);
@@ -2070,7 +2203,7 @@ static void markOwnWrite(const wchar_t *path) {
   if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) gSettingsTime = a.ftLastWriteTime;
 }
 
-// Writes all current settings to settings.json, with the explanation at the top. Used to
+// Writes all current settings to settings.yaml, with the explanation at the top. Used to
 // create the file and to bring a file from an older version up to date.
 static void settingsWrite(void) {
   wchar_t path[MAX_PATH];
@@ -2079,21 +2212,21 @@ static void settingsWrite(void) {
   snprintf(speed, sizeof speed, gSpeedMul == floor(gSpeedMul) ? "%.1f" : "%g", gSpeedMul);
   FILE *f = _wfopen(path, L"wb");
   if (!f) return;
-  fprintf(f, "%s{\n"
-             "  \"runAtStartup\": %s,\n"
-             "  \"runAsAdministrator\": %s,\n"
-             "  \"threeFingerDragSpeed\": %s,\n"
-             "  \"keyRemaps\": {",
+  fprintf(f, "%s"
+             "runAtStartup: %s\n"
+             "runAsAdministrator: %s\n"
+             "threeFingerDragSpeed: %s\n",
           kSettingsHelp, gRunAtStartup ? "true" : "false", gRunAsAdmin ? "true" : "false", speed);
   AcquireSRWLockShared(&gRemapLock);
+  fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
-    fprintf(f, "%s\n    ", i ? "," : "");
-    jsonPut(f, gRemaps[i].fromText);
+    fputs("  ", f);
+    yamlPut(f, gRemaps[i].fromText);
     fputs(": ", f);
-    jsonPut(f, gRemaps[i].toText);
+    yamlPut(f, gRemaps[i].toText);
+    fputc('\n', f);
   }
   ReleaseSRWLockShared(&gRemapLock);
-  fprintf(f, "%s}\n}\n", gRemapCount ? "\n  " : "");
   fclose(f);
   markOwnWrite(path);
 }
@@ -2103,24 +2236,20 @@ static void settingsWrite(void) {
 static void settingsSetBool(const char *name, bool value) {
   wchar_t path[MAX_PATH];
   if (!settingsPath(path)) return;
-  char text[8192], pattern[64];
+  char text[8192];
   FILE *f = _wfopen(path, L"rb");
   size_t n = f ? fread(text, 1, sizeof text - 1, f) : 0;
   if (f) fclose(f);
   text[n] = 0;
-  snprintf(pattern, sizeof pattern, "\"%s\"", name);
-  for (char *k = strstr(text, pattern); k; k = strstr(k + 1, pattern)) {
-    char *line = k;  // skip mentions inside // comments
-    while (line > text && line[-1] != '\n') line--;
-    while (*line == ' ' || *line == '\t') line++;
-    if (line[0] == '/' && line[1] == '/') continue;
-    char *v = k + strlen(pattern);
+  size_t nameLen = strlen(name);
+  for (char *line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+    if (strncmp(line, name, nameLen) != 0) continue;  // top-level lines start at column 0
+    char *v = line + nameLen;
     while (*v == ' ' || *v == '\t') v++;
     if (*v != ':') continue;
     v++;
     while (*v == ' ' || *v == '\t') v++;
-    size_t oldLen = strncmp(v, "true", 4) == 0 ? 4 : strncmp(v, "false", 5) == 0 ? 5 : 0;
-    if (!oldLen) break;
+    size_t oldLen = strcspn(v, " \t\r\n#");
     f = _wfopen(path, L"wb");
     if (!f) return;
     fwrite(text, 1, (size_t)(v - text), f);
@@ -2133,61 +2262,27 @@ static void settingsSetBool(const char *name, bool value) {
   settingsWrite();
 }
 
-// Loads settings.json if it changed since last time (creating it with the defaults if
-// it doesn't exist). userEdit: the user saved it, so apply and confirm the changes.
-static void settingsLoad(bool userEdit) {
-  wchar_t path[MAX_PATH];
-  if (!settingsPath(path)) return;
-  WIN32_FILE_ATTRIBUTE_DATA a;
-  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) {  // first run: create it
-    static Remap defaults[MAX_REMAPS];
-    int count;
-    defaultRemaps(defaults, &count);
-    setRemaps(defaults, count);
-    settingsWrite();
-    return;
-  }
-  if (CompareFileTime(&a.ftLastWriteTime, &gSettingsTime) == 0) return;  // unchanged
-  gSettingsTime = a.ftLastWriteTime;
-
-  FILE *f = _wfopen(path, L"rb");
-  if (!f) return;
-  char text[8192];
-  size_t n = fread(text, 1, sizeof text - 1, f);
-  fclose(f);
-  text[n] = 0;
-  if (n == 0 && userEdit) return;  // editors sometimes truncate before writing: wait for the real save
-
-  static Settings st;  // big (the remap list): not on the stack
-  memset(&st, 0, sizeof st);
-  st.runAtStartup = st.runAsAdmin = true;  // defaults for anything the file leaves out
-  st.speed = 1.0;
-  char err[160];
-  if (!parseSettings(text, &st, err, sizeof err)) {
-    LOG("settings.json not applied: %s\n", err);
-    _snwprintf(gSettingsError, 256, L"settings.json has a mistake: %hs. Keeping the previous settings.", err);
-    if (gWnd) { trayNotify(L"Macify settings not applied", gSettingsError); gSettingsError[0] = 0; }
-    return;
-  }
-  if (!(st.found & FOUND_REMAPS)) defaultRemaps(st.remaps, &st.remapCount);
-  bool dragChanged = st.speed != gSpeedMul;
-  bool startupChanged = st.runAtStartup != gRunAtStartup || st.runAsAdmin != gRunAsAdmin;
+// Applies parsed settings. userEdit: the user saved the file, so confirm the changes.
+static void settingsApply(Settings *st, bool userEdit) {
+  if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount);
+  bool dragChanged = st->speed != gSpeedMul;
+  bool startupChanged = st->runAtStartup != gRunAtStartup || st->runAsAdmin != gRunAsAdmin;
   AcquireSRWLockShared(&gRemapLock);
-  bool remapsChanged = st.remapCount != gRemapCount ||
-                       memcmp(st.remaps, gRemaps, sizeof(Remap) * st.remapCount) != 0;
+  bool remapsChanged = st->remapCount != gRemapCount ||
+                       memcmp(st->remaps, gRemaps, sizeof(Remap) * st->remapCount) != 0;
   ReleaseSRWLockShared(&gRemapLock);
-  gRunAtStartup = st.runAtStartup;
-  gRunAsAdmin = st.runAsAdmin;
-  gSpeedMul = st.speed;
-  setRemaps(st.remaps, st.remapCount);
+  gRunAtStartup = st->runAtStartup;
+  gRunAsAdmin = st->runAsAdmin;
+  gSpeedMul = st->speed;
+  setRemaps(st->remaps, st->remapCount);
   LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f, %d key remaps\n",
       gRunAtStartup, gRunAsAdmin, gSpeedMul, gRemapCount);
-  if (st.skipped[0]) LOG("settings: skipped %s\n", st.skipped);
+  if (st->skipped[0]) LOG("settings: skipped %s\n", st->skipped);
   // From an older version: add missing settings (and the explanation), drop removed ones.
-  if (st.found != FOUND_ALL || (st.found & FOUND_OBSOLETE)) settingsWrite();
+  if (st->found != FOUND_ALL) settingsWrite();
 
-  if (st.skipped[0]) {
-    _snwprintf(gSettingsError, 256, L"Skipped %hs. The other settings are applied.", st.skipped);
+  if (st->skipped[0]) {
+    _snwprintf(gSettingsError, 256, L"Skipped %hs. The other settings are applied.", st->skipped);
     if (gWnd) { trayNotify(L"Some key remaps were skipped", gSettingsError); gSettingsError[0] = 0; }
   } else if (userEdit && (dragChanged || remapsChanged)) {
     wchar_t msg[160];
@@ -2195,6 +2290,60 @@ static void settingsLoad(bool userEdit) {
     trayNotify(L"Macify settings applied", msg);
   }
   if (userEdit && startupChanged && gWnd) applyStartup();
+}
+
+static void settingsDefaults(Settings *st) {
+  memset(st, 0, sizeof *st);
+  st->runAtStartup = st->runAsAdmin = true;  // for anything the file leaves out
+  st->speed = 1.0;
+}
+
+static size_t readSmallFile(const wchar_t *path, char *text, size_t size) {
+  FILE *f = _wfopen(path, L"rb");
+  if (!f) return 0;
+  size_t n = fread(text, 1, size - 1, f);
+  fclose(f);
+  text[n] = 0;
+  return n;
+}
+
+// Loads settings.yaml if it changed since last time. Creates it on first run, or from
+// settings.json (versions up to 1.8). userEdit: the user saved it.
+static void settingsLoad(bool userEdit) {
+  static Settings st;  // big (the remap list): not on the stack
+  static char text[8192];
+  wchar_t path[MAX_PATH], json[MAX_PATH];
+  if (!settingsPath(path)) return;
+  WIN32_FILE_ATTRIBUTE_DATA a;
+  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) {
+    char err[160];
+    settingsDefaults(&st);
+    if (dataFile(json, L"settings.json") && readSmallFile(json, text, sizeof text) &&
+        parseSettings(text, &st, err, sizeof err)) {
+      st.found &= ~FOUND_ALL;  // write the YAML file in any case
+      settingsApply(&st, false);
+      DeleteFileW(json);
+      LOG("settings: converted settings.json to settings.yaml\n");
+    } else {
+      settingsApply(&st, false);  // first run: defaults (written by settingsApply)
+    }
+    return;
+  }
+  if (CompareFileTime(&a.ftLastWriteTime, &gSettingsTime) == 0) return;  // unchanged
+  gSettingsTime = a.ftLastWriteTime;
+
+  size_t n = readSmallFile(path, text, sizeof text);
+  if (n == 0 && userEdit) return;  // editors sometimes truncate before writing: wait for the real save
+
+  settingsDefaults(&st);
+  char err[200];
+  if (!parseSettingsYaml(text, &st, err, sizeof err)) {
+    LOG("settings.yaml not applied: %s\n", err);
+    _snwprintf(gSettingsError, 256, L"settings.yaml has a mistake: %hs. Keeping the previous settings.", err);
+    if (gWnd) { trayNotify(L"Macify settings not applied", gSettingsError); gSettingsError[0] = 0; }
+    return;
+  }
+  settingsApply(&st, userEdit);
 }
 
 // Watches %APPDATA%\Macify so saved changes apply right away.
@@ -2206,14 +2355,17 @@ static void settingsWatchStart(void) {
   gSettingsWatch = FindFirstChangeNotificationW(path, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
 }
 
-// Opens settings.json in the default editor, without admin rights: Explorer (which runs
-// as the user) opens it on our behalf.
+// Opens settings.yaml in the app set up for .yaml files, without admin rights: Explorer
+// (which runs as the user) opens it on our behalf. If no app is set up for .yaml, Notepad.
 static void settingsEdit(void) {
-  wchar_t path[MAX_PATH], args[MAX_PATH + 4];
+  wchar_t path[MAX_PATH], args[MAX_PATH + 4], app[MAX_PATH];
   if (!settingsPath(path)) return;
   settingsLoad(false);  // make sure it exists
+  DWORD size = MAX_PATH;
+  bool hasApp = SUCCEEDED(AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_EXECUTABLE, L".yaml", NULL, app, &size));
   _snwprintf(args, MAX_PATH + 4, L"\"%ls\"", path);
-  ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+  if (hasApp) ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+  else ShellExecuteW(NULL, L"open", L"notepad.exe", args, NULL, SW_SHOWNORMAL);
 }
 
 // ---------------------------------------------------------------- updates
@@ -2434,7 +2586,7 @@ static bool takeFlag(const wchar_t *name) {
 static int applyUpdate(DWORD oldPid) {
   HANDLE old = oldPid ? OpenProcess(SYNCHRONIZE, FALSE, oldPid) : NULL;
   if (old) { WaitForSingleObject(old, 15000); CloseHandle(old); }
-  int code = installTask(NULL, 0);  // also reads settings.json
+  int code = installTask(NULL, 0);  // also reads settings.yaml
   if (code == 0) {
     wchar_t target[MAX_PATH], targetDir[MAX_PATH];
     if (installedPath(target, targetDir)) setTaskMarker(gRunAsAdmin ? target : NULL, gRunAtStartup);
