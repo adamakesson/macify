@@ -138,6 +138,7 @@
 #define ID_SETTINGS 104
 #define ID_UPDATE 105
 #define ID_AUTOUPDATE 107
+#define UNINSTALL_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Macify"
 #define WM_UPDATE_RESULT (WM_APP + 5)
 #define UPDATE_API L"https://api.github.com/repos/adamakesson/macify/releases/latest"
 
@@ -1630,6 +1631,34 @@ static int registerTask(const wchar_t *exe, const wchar_t *dir, bool startup, co
 }
 
 // Needs admin rights: makes the task match settings.yaml for the installed copy.
+// The entry in Settings > Apps > Installed apps (needs admin rights).
+static void registerUninstallEntry(const wchar_t *exe, const wchar_t *dir) {
+  HKEY key;
+  if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;
+  wchar_t text[MAX_PATH + 32];
+  #define SETSTR(name, value) RegSetValueExW(key, name, 0, REG_SZ, (const BYTE *)(value), (DWORD)((wcslen(value) + 1) * sizeof(wchar_t)))
+  SETSTR(L"DisplayName", L"Macify");
+  _snwprintf(text, MAX_PATH + 32, L"%hs", MACIFY_VERSION_STR);
+  SETSTR(L"DisplayVersion", text);
+  SETSTR(L"Publisher", L"adamakesson");
+  SETSTR(L"URLInfoAbout", L"https://github.com/adamakesson/macify");
+  SETSTR(L"InstallLocation", dir);
+  _snwprintf(text, MAX_PATH + 32, L"\"%ls\",0", exe);
+  SETSTR(L"DisplayIcon", text);
+  _snwprintf(text, MAX_PATH + 32, L"\"%ls\" --uninstall", exe);
+  SETSTR(L"UninstallString", text);
+  _snwprintf(text, MAX_PATH + 32, L"\"%ls\" --uninstall-now", exe);
+  SETSTR(L"QuietUninstallString", text);
+  #undef SETSTR
+  DWORD one = 1, sizeKb = 0;
+  WIN32_FILE_ATTRIBUTE_DATA a;
+  if (GetFileAttributesExW(exe, GetFileExInfoStandard, &a)) sizeKb = (a.nFileSizeLow + 1023) / 1024;
+  RegSetValueExW(key, L"NoModify", 0, REG_DWORD, (const BYTE *)&one, sizeof one);
+  RegSetValueExW(key, L"NoRepair", 0, REG_DWORD, (const BYTE *)&one, sizeof one);
+  RegSetValueExW(key, L"EstimatedSize", 0, REG_DWORD, (const BYTE *)&sizeKb, sizeof sizeKb);
+  RegCloseKey(key);
+}
+
 static int configureTask(const wchar_t *user) {
   wchar_t target[MAX_PATH], targetDir[MAX_PATH];
   if (!installedPath(target, targetDir)) return 1;
@@ -1655,6 +1684,7 @@ static int installTask(const wchar_t *user, DWORD callerPid) {
     _snwprintf(stream, MAX_PATH + 20, L"%ls:Zone.Identifier", target);
     DeleteFileW(stream);
   }
+  registerUninstallEntry(target, targetDir);
   return configureTask(user);
 }
 
@@ -1776,6 +1806,7 @@ static void applyStartup(void) {
       }
     }
     if (!isElevated() || !installed) switchInstance(true, NULL);
+    else registerUninstallEntry(target, targetDir);
   } else {
     setRunEntry(gRunAtStartup ? exe : NULL);
     if (taskExists()) {
@@ -1796,6 +1827,91 @@ static void toggleSetting(bool *value) {
   *value = !*value;
   settingsSetBool(value == &gRunAtStartup ? "runAtStartup" : "runAsAdministrator", *value);
   applyStartup();
+}
+
+// ---------------------------------------------------------------- uninstall
+//
+// From Settings > Apps ("--uninstall"): asks first, then (with admin
+// rights) closes Macify and removes everything it added.
+
+static void deleteFolder(const wchar_t *dir) {  // our folders only hold plain files
+  wchar_t pattern[MAX_PATH], path[MAX_PATH];
+  _snwprintf(pattern, MAX_PATH, L"%ls\\*", dir);
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW(pattern, &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+      _snwprintf(path, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+      DeleteFileW(path);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  RemoveDirectoryW(dir);
+}
+
+// Runs with admin rights ("--uninstall-now [pid]"): waits for that copy of Macify to
+// exit, closes any other, and removes everything.
+static int uninstallNow(DWORD waitPid) {
+  HANDLE old = waitPid ? OpenProcess(SYNCHRONIZE, FALSE, waitPid) : NULL;
+  if (old) { WaitForSingleObject(old, 15000); CloseHandle(old); }
+  stopRunningInstance(0);
+
+  deleteTask();
+  setRunEntry(NULL);
+  const wchar_t *appData = _wgetenv(L"APPDATA");
+  if (appData) {
+    wchar_t path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%ls\\Microsoft\\Windows\\Start Menu\\Programs\\Macify.lnk", appData);
+    DeleteFileW(path);
+    _snwprintf(path, MAX_PATH, L"%ls\\Macify", appData);  // settings, learned speed curve
+    deleteFolder(path);
+  }
+  RegDeleteTreeW(HKEY_LOCAL_MACHINE, UNINSTALL_KEY);
+
+  // The program folder. If this is the installed copy it can't delete its own exe while
+  // running (nor while the "--uninstall" copy shows its last message): a hidden command
+  // keeps trying to remove the folder for a minute, until nothing has it open.
+  wchar_t exe[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], targetDir[MAX_PATH];
+  if (exePath(exe, dir) && installedPath(target, targetDir)) {
+    if (_wcsicmp(exe, target) != 0) {
+      DeleteFileW(target);
+      deleteFolder(targetDir);
+    } else {
+      wchar_t cmd[MAX_PATH * 2];
+      _snwprintf(cmd, MAX_PATH * 2, L"cmd.exe /c for /l %%i in (1,1,60) do @(ping 127.0.0.1 -n 2 > nul & rmdir /s /q \"%ls\" 2> nul & if not exist \"%ls\" exit)", targetDir, targetDir);
+      STARTUPINFOW si = { .cb = sizeof si };
+      PROCESS_INFORMATION pi;
+      if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+      }
+    }
+  }
+  return 0;
+}
+
+static bool confirmUninstall(void) {
+  return MessageBoxW(NULL,
+    L"Uninstall Macify?\n\n"
+    L"This closes Macify and removes it from this PC: the program, its startup task, its "
+    L"Start menu shortcut, your settings and the learned pointer speed.",
+    L"Uninstall Macify", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES;
+}
+
+static void uninstallDone(int code) {
+  if (code == 0)
+    MessageBoxW(NULL, L"Macify has been uninstalled.", L"Uninstall Macify", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+  else if (code != -1)  // -1: the admin prompt was declined
+    MessageBoxW(NULL, L"Macify couldn't be uninstalled.", L"Uninstall Macify", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+}
+
+// "--uninstall" (Settings > Apps): ask, then uninstall with admin rights.
+static int uninstallInteractive(void) {
+  if (!confirmUninstall()) return 1;
+  int code = isElevated() ? uninstallNow(0) : runElevated(L"--uninstall-now");
+  uninstallDone(code);
+  return code;
 }
 
 // ---------------------------------------------------------------- debug log
@@ -2819,6 +2935,10 @@ static int run(void) {
   if (argv && argc >= 2 && wcscmp(argv[1], L"--install") == 0)
     return installTask(argc >= 3 ? argv[2] : NULL, argc >= 4 ? wcstoul(argv[3], NULL, 10) : 0);
   if (argv && argc >= 2 && wcscmp(argv[1], L"--configure") == 0) return configureTask(argc >= 3 ? argv[2] : NULL);
+  if (argv && argc >= 2 && wcscmp(argv[1], L"--uninstall") == 0) return uninstallInteractive();
+  if (argv && argc >= 2 && wcscmp(argv[1], L"--uninstall-now") == 0) {
+    return uninstallNow(argc >= 3 ? wcstoul(argv[2], NULL, 10) : 0);
+  }
   if (argv && argc >= 2 && wcscmp(argv[1], L"--update") == 0)
     return applyUpdate(argc >= 3 ? wcstoul(argv[2], NULL, 10) : 0);
 

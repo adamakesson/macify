@@ -173,9 +173,13 @@ release as release notes. Installed copies pick it up with **Check for updates**
 
 ## Uninstall
 
-1. Tray icon → untick **Run at startup** and **Run as administrator**, then **Quit**.
-2. Delete `C:\Program Files\Macify`, `%APPDATA%\Macify` and the Start menu shortcut
-   (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Macify.lnk`).
+**Settings → Apps → Installed apps → Macify → Uninstall**, like any other app. After a
+confirmation and a UAC prompt, Macify closes and removes everything it added: the program
+in `C:\Program Files\Macify`, the `Macify` scheduled task, the startup entry, the Start
+menu shortcut, and your settings and learned pointer speed in `%APPDATA%\Macify`.
+
+(Running `"C:\Program Files\Macify\macify.exe" --uninstall` does the same. Copies
+installed before 1.18 show up in Installed apps once they've updated to 1.18.)
 
 ## Building
 
