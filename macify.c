@@ -69,6 +69,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <shellapi.h>
+#include <winhttp.h>
 #include <shlobj.h>
 #include <objbase.h>
 #include <hidusage.h>
@@ -130,6 +131,9 @@
 #define ID_AUTOSTART 102
 #define ID_DEBUG 103
 #define ID_SETTINGS 104
+#define ID_UPDATE 105
+#define WM_UPDATE_RESULT (WM_APP + 5)
+#define UPDATE_API L"https://api.github.com/repos/adamakesson/macify/releases/latest"
 
 // speed-curve learning
 #define LEARN_BINS          16
@@ -149,6 +153,8 @@ static void debugLog(const char *fmt, ...);
 static void debugStart(void);
 static void debugFinish(void);
 static void settingsEdit(void);
+static void updateCheck(void);
+static volatile bool gUpdateBusy;
 
 typedef struct {
   ULONG id;
@@ -1179,6 +1185,8 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
   AppendMenuW(menu, MF_STRING | (gAutostart ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows as administrator");
   AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
+  AppendMenuW(menu, MF_STRING | (gUpdateBusy ? MF_GRAYED : 0), ID_UPDATE,
+              gUpdateBusy ? L"Checking for updates..." : L"Check for updates");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug log (save to desktop)" : L"Start debug log");
   AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit");
@@ -1189,6 +1197,7 @@ static void showTrayMenu(void) {
   if (cmd == ID_RELEARN) { curveClear(); curveSave(); }
   if (cmd == ID_AUTOSTART) toggleAutostart();
   if (cmd == ID_SETTINGS) settingsEdit();
+  if (cmd == ID_UPDATE) updateCheck();
   if (cmd == ID_DEBUG) { if (gDebugOn) debugFinish(); else debugStart(); }
   if (cmd == ID_QUIT) quit();
 }
@@ -1797,6 +1806,256 @@ static void settingsEdit(void) {
   ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
 }
 
+// ---------------------------------------------------------------- updates
+//
+// "Check for updates" asks GitHub for the latest release of adamakesson/macify. If its
+// version is higher and it has a macify.exe attached, that is downloaded and, after you
+// confirm, started with "--update": it waits for this copy to exit, installs itself in
+// Program Files the same way a first install does, and starts.
+
+typedef struct {
+  int status;  // 0: up to date, 1: newer version downloaded, 2: no releases, -1: error
+  char tag[32];
+  wchar_t file[MAX_PATH];
+  char error[160];
+} UpdateResult;
+
+// GET a URL into memory (redirects are followed). Returns false on network errors.
+static bool httpGet(const wchar_t *url, bool api, char **out, size_t *outLen, DWORD *status) {
+  wchar_t host[256], path[2048], agent[32];
+  URL_COMPONENTS uc = { 0 };
+  uc.dwStructSize = sizeof uc;
+  uc.lpszHostName = host;
+  uc.dwHostNameLength = 256;
+  uc.lpszUrlPath = path;
+  uc.dwUrlPathLength = 2048;
+  if (!WinHttpCrackUrl(url, 0, 0, &uc)) return false;
+  _snwprintf(agent, 32, L"Macify/%hs", MACIFY_VERSION_STR);  // GitHub requires a User-Agent
+
+  bool ok = false;
+  char *buf = NULL;
+  size_t len = 0, cap = 0;
+  HINTERNET s = WinHttpOpen(agent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  HINTERNET c = s ? WinHttpConnect(s, host, uc.nPort, 0) : NULL;
+  HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                       uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : NULL;
+  if (r && api) WinHttpAddRequestHeaders(r, L"Accept: application/vnd.github+json", (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+  if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+      WinHttpReceiveResponse(r, NULL)) {
+    DWORD code = 0, size = sizeof code;
+    WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                        &code, &size, WINHTTP_NO_HEADER_INDEX);
+    *status = code;
+    ok = true;
+    for (DWORD avail = 0; WinHttpQueryDataAvailable(r, &avail) && avail > 0;) {
+      if (len + avail + 1 > cap) {
+        cap = (len + avail + 1) * 2;
+        if (cap > (64u << 20)) { ok = false; break; }  // nothing of ours is this big
+        char *grown = realloc(buf, cap);
+        if (!grown) { ok = false; break; }
+        buf = grown;
+      }
+      DWORD got = 0;
+      if (!WinHttpReadData(r, buf + len, avail, &got)) { ok = false; break; }
+      len += got;
+    }
+  }
+  if (r) WinHttpCloseHandle(r);
+  if (c) WinHttpCloseHandle(c);
+  if (s) WinHttpCloseHandle(s);
+  if (!ok) { free(buf); return false; }
+  if (!buf) buf = calloc(1, 1);
+  else buf[len] = 0;
+  *out = buf;
+  *outLen = len;
+  return true;
+}
+
+// The string value after "key": at or after *from (advanced past it). JSON escapes are
+// only unescaped for "\/", which is all GitHub uses in these fields.
+static bool jsonValue(const char **from, const char *key, char *out, size_t n) {
+  char pattern[64];
+  snprintf(pattern, sizeof pattern, "\"%s\"", key);
+  const char *k = strstr(*from, pattern);
+  if (!k) return false;
+  const char *v = strchr(k + strlen(pattern), '"');
+  if (!v) return false;
+  size_t o = 0;
+  for (v++; *v && *v != '"'; v++) {
+    if (*v == '\\' && v[1]) v++;
+    if (o + 1 < n) out[o++] = *v;
+  }
+  out[o] = 0;
+  *from = v;
+  return true;
+}
+
+// Compares "v1.10" with "1.9" etc.: negative, 0 or positive like strcmp.
+static int compareVersions(const char *a, const char *b) {
+  while (*a && !(*a >= '0' && *a <= '9')) a++;
+  while (*b && !(*b >= '0' && *b <= '9')) b++;
+  while (*a || *b) {
+    long x = strtol(a, (char **)&a, 10), y = strtol(b, (char **)&b, 10);
+    if (x != y) return x < y ? -1 : 1;
+    if (*a == '.') a++;
+    if (*b == '.') b++;
+    if (!(*a >= '0' && *a <= '9') && !(*b >= '0' && *b <= '9')) break;
+  }
+  return 0;
+}
+
+static DWORD WINAPI updateThread(LPVOID unused) {
+  (void)unused;
+  UpdateResult *res = calloc(1, sizeof *res);
+  if (!res) { gUpdateBusy = false; return 0; }
+  char *body = NULL;
+  size_t len = 0;
+  DWORD status = 0;
+  if (!httpGet(UPDATE_API, true, &body, &len, &status)) {
+    res->status = -1;
+    snprintf(res->error, sizeof res->error, "couldn't reach GitHub (are you online?)");
+  } else if (status == 404) {
+    res->status = 2;
+  } else if (status != 200) {
+    res->status = -1;
+    snprintf(res->error, sizeof res->error, "GitHub answered with error %lu", (unsigned long)status);
+  } else {
+    const char *p = body;
+    char url[1024] = "", candidate[1024];
+    if (!jsonValue(&p, "tag_name", res->tag, sizeof res->tag)) {
+      res->status = -1;
+      snprintf(res->error, sizeof res->error, "unexpected answer from GitHub");
+    } else if (compareVersions(res->tag, MACIFY_VERSION_STR) <= 0) {
+      res->status = 0;
+    } else {
+      p = body;
+      while (jsonValue(&p, "browser_download_url", candidate, sizeof candidate)) {
+        size_t n = strlen(candidate);
+        if (n >= 11 && _stricmp(candidate + n - 11, "/macify.exe") == 0) { strcpy(url, candidate); break; }
+      }
+      if (!*url) {
+        res->status = -1;
+        snprintf(res->error, sizeof res->error, "release %s has no macify.exe attached", res->tag);
+      }
+    }
+    LOG("update check: latest %s, running %s\n", res->tag, MACIFY_VERSION_STR);
+    if (*url) {
+      wchar_t wurl[1024];
+      MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 1024);
+      char *exe = NULL;
+      size_t exeLen = 0;
+      if (!httpGet(wurl, false, &exe, &exeLen, &status) || status != 200) {
+        res->status = -1;
+        snprintf(res->error, sizeof res->error, "the download of %s failed", res->tag);
+      } else if (exeLen < 20000 || exe[0] != 'M' || exe[1] != 'Z') {  // not a Windows program
+        res->status = -1;
+        snprintf(res->error, sizeof res->error, "the download of %s isn't a valid macify.exe", res->tag);
+      } else {
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        _snwprintf(res->file, MAX_PATH, L"%lsmacify-update-%hs.exe", tmp, res->tag);
+        FILE *f = _wfopen(res->file, L"wb");
+        bool written = f && fwrite(exe, 1, exeLen, f) == exeLen;
+        if (f) fclose(f);
+        res->status = written ? 1 : -1;
+        if (!written) snprintf(res->error, sizeof res->error, "the update couldn't be saved");
+      }
+      free(exe);
+    }
+  }
+  free(body);
+  PostMessageW(gWnd, WM_UPDATE_RESULT, 0, (LPARAM)res);
+  return 0;
+}
+
+static void updateCheck(void) {
+  if (gUpdateBusy) return;
+  gUpdateBusy = true;
+  HANDLE t = CreateThread(NULL, 0, updateThread, NULL, 0, NULL);
+  if (t) CloseHandle(t);
+  else gUpdateBusy = false;
+}
+
+static void updateResult(UpdateResult *res) {
+  gUpdateBusy = false;
+  wchar_t msg[256];
+  if (res->status == 0) {
+    _snwprintf(msg, 256, L"You have the latest version, %hs.", MACIFY_VERSION_STR);
+    trayNotify(L"Macify is up to date", msg);
+  } else if (res->status == 2) {
+    trayNotify(L"No Macify releases yet", L"There are no published releases on GitHub to update from.");
+  } else if (res->status < 0) {
+    _snwprintf(msg, 256, L"The update check failed: %hs.", res->error);
+    trayNotify(L"Macify update failed", msg);
+  } else {
+    _snwprintf(msg, 256, L"Macify %hs is available (you have %hs).\n\nInstall it now?", res->tag, MACIFY_VERSION_STR);
+    if (MessageBoxW(gWnd, msg, L"Macify update", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) == IDYES) {
+      wchar_t params[32];
+      _snwprintf(params, 32, L"--update %lu", GetCurrentProcessId());
+      SHELLEXECUTEINFOW sei = { 0 };
+      sei.cbSize = sizeof sei;
+      sei.lpVerb = L"runas";  // admin rights for Program Files (no prompt if already elevated)
+      sei.lpFile = res->file;
+      sei.lpParameters = params;
+      sei.nShow = SW_HIDE;
+      if (ShellExecuteExW(&sei)) quit();  // the update takes over once we're gone
+    } else {
+      DeleteFileW(res->file);
+    }
+  }
+  free(res);
+}
+
+static void flagFile(const wchar_t *name, bool set) {
+  wchar_t path[MAX_PATH];
+  if (!dataFile(path, name)) return;
+  if (set) writeUtf16(path, L"");
+  else DeleteFileW(path);
+}
+
+static bool takeFlag(const wchar_t *name) {
+  wchar_t path[MAX_PATH];
+  if (!dataFile(path, name) || GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return false;
+  DeleteFileW(path);
+  return true;
+}
+
+// Runs from the downloaded exe ("--update <pid>"), with admin rights.
+static int applyUpdate(DWORD oldPid) {
+  HANDLE old = oldPid ? OpenProcess(SYNCHRONIZE, FALSE, oldPid) : NULL;
+  if (old) { WaitForSingleObject(old, 15000); CloseHandle(old); }
+  int code = installTask(NULL, 0);
+  if (code == 0) {
+    wchar_t target[MAX_PATH], targetDir[MAX_PATH];
+    if (installedPath(target, targetDir)) setMarker(target);
+    setOptedOut(false);
+    flagFile(L"just-updated", true);
+  } else {
+    flagFile(L"update-failed", true);
+  }
+  if (!startTask()) {  // no startup task: start the installed copy directly
+    wchar_t target[MAX_PATH], targetDir[MAX_PATH];
+    if (installedPath(target, targetDir)) ShellExecuteW(NULL, L"open", target, NULL, targetDir, SW_SHOWNORMAL);
+  }
+  return code;
+}
+
+// Earlier downloads in %TEMP% (an update can't delete itself while running).
+static void cleanUpdateDownloads(void) {
+  wchar_t tmp[MAX_PATH], pattern[MAX_PATH], path[MAX_PATH], self[MAX_PATH];
+  GetModuleFileNameW(NULL, self, MAX_PATH);
+  GetTempPathW(MAX_PATH, tmp);
+  _snwprintf(pattern, MAX_PATH, L"%lsmacify-update-*.exe", tmp);
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    _snwprintf(path, MAX_PATH, L"%ls%ls", tmp, fd.cFileName);
+    if (_wcsicmp(path, self) != 0) DeleteFileW(path);
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
+
 // ---------------------------------------------------------------- window plumbing
 
 static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1815,6 +2074,9 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       break;
+    case WM_UPDATE_RESULT:
+      updateResult((UpdateResult *)lp);
+      return 0;
     case WM_CANCEL_DRAG:
       if (gReleasePending) { LOG("cursor moved during grace period\n"); endDrag(); }
       return 0;
@@ -1855,6 +2117,8 @@ static int run(void) {
   if (argv && argc >= 2 && wcscmp(argv[1], L"--install") == 0)
     return installTask(argc >= 3 ? argv[2] : NULL, argc >= 4 ? wcstoul(argv[3], NULL, 10) : 0);
   if (argv && argc >= 2 && wcscmp(argv[1], L"--uninstall") == 0) return uninstallTask();
+  if (argv && argc >= 2 && wcscmp(argv[1], L"--update") == 0)
+    return applyUpdate(argc >= 3 ? wcstoul(argv[2], NULL, 10) : 0);
 
   // The old version (before the rename) still running would fight over the same input.
   HANDLE old = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\" OLD_NAME);
@@ -1941,6 +2205,14 @@ static int run(void) {
   SetTimer(gWnd, TIMER_SAVE, SAVE_INTERVAL_MS, NULL);
   gIcon = makeIcon();
   trayAdd();
+  cleanUpdateDownloads();
+  if (takeFlag(L"just-updated")) {
+    wchar_t msg[96];
+    _snwprintf(msg, 96, L"You're now running Macify %hs.", MACIFY_VERSION_STR);
+    trayNotify(L"Macify updated", msg);
+  }
+  if (takeFlag(L"update-failed"))
+    trayNotify(L"Macify update failed", L"The new version couldn't be installed in Program Files, so the previous one is still running.");
   if (justInstalled()) {
     markJustInstalled(false);
     trayNotify(L"Macify is installed and running",

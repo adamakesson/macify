@@ -88,9 +88,17 @@ It never records what you type. Logging costs nothing while off.
 
 ## Updating
 
-Run the new `macify.exe` the same way. After the UAC prompt it closes the running copy,
-replaces the one in Program Files and starts it. Settings and the learned pointer speed
-are kept.
+Tray icon → **Check for updates**. If a newer release is published here, Macify downloads
+it and asks before installing: the update closes the running copy, replaces the one in
+Program Files, keeps your settings and learned pointer speed, and starts. (Running a newer
+`macify.exe` by hand does the same, after a UAC prompt.)
+
+### Publishing a release
+
+1. Bump the version in [`version.h`](version.h) and build.
+2. Create a release whose tag is the version (`v1.5`) and attach the built `macify.exe`.
+   The update check compares the tag with the running version and downloads the
+   attachment named exactly `macify.exe`.
 
 ## Uninstall
 
