@@ -889,12 +889,17 @@ static int gRemapCount;
 static SRWLOCK gRemapLock = SRWLOCK_INIT;
 
 static const char *const kDefaultRemaps[][2] = {
-  { "Ctrl+D", "Delete" },          { "Ctrl+Backspace", "Delete" },
-  { "Ctrl+2", "Ctrl+Alt+2" },      { "Ctrl+3", "Ctrl+Alt+3" },      { "Ctrl+4", "Ctrl+Alt+4" },
-  { "Ctrl+7", "Ctrl+Alt+7" },      { "Ctrl+8", "Ctrl+Alt+8" },      { "Ctrl+9", "Ctrl+Alt+9" },
-  { "Ctrl+0", "Ctrl+Alt+0" },
-  { "Ctrl+<", "Ctrl+Alt+<" },      { "Ctrl+´", "Ctrl+Alt+<" },
-  { "Ctrl+H", "Win+M" },           { "Ctrl+I", "Ctrl+Shift+C" },    { "Ctrl+Shift+7", "Alt+Shift+A" },
+  { "Ctrl+D", "Delete" },           { "Ctrl+Backspace", "Delete" },
+  { "Ctrl+Shift+3", "Win+PrintScreen" }, { "Ctrl+Shift+4", "Win+Shift+S" },
+  { "Ctrl+1", "Ctrl+Alt+1" },       { "Ctrl+2", "Ctrl+Alt+2" },       { "Ctrl+3", "Ctrl+Alt+3" },
+  { "Ctrl+4", "Ctrl+Alt+4" },       { "Ctrl+7", "Ctrl+Alt+7" },       { "Ctrl+8", "Ctrl+Alt+8" },
+  { "Ctrl+9", "Ctrl+Alt+9" },       { "Ctrl+0", "Ctrl+Alt+0" },
+  { "Ctrl+\u00B4", "Ctrl+Alt+<" },  { "Ctrl+I", "Ctrl+Shift+C" },
+  { "Ctrl++", "Ctrl+Alt++" },       { "Ctrl+-", "Win+-" },            { "Ctrl+<", "Ctrl+Alt+<" },
+  { "Alt+1", "Ctrl+1" },            { "Alt+2", "Ctrl+2" },            { "Alt+3", "Ctrl+3" },
+  { "Alt+4", "Ctrl+4" },            { "Alt+5", "Ctrl+5" },            { "Alt+6", "Ctrl+6" },
+  { "Alt+7", "Ctrl+7" },            { "Alt+8", "Ctrl+8" },            { "Alt+9", "Ctrl+9" },
+  { "Alt+0", "Ctrl+0" },            { "Alt++", "Ctrl++" },            { "Alt+-", "Ctrl+-" },
 };
 
 static const struct { const char *name; UINT vk; } kKeyNames[] = {
@@ -1010,6 +1015,7 @@ static bool kSup[256];       // modifiers hidden from apps for a remapped click,
 static bool kSwallowUp[256]; // hotkey keys whose release must be swallowed too
 static bool gClickRemapped;
 static bool gWinFromW;       // left Alt+W is being held as the Windows key
+static bool gAltGrDown;      // AltGr is held (it sends a hidden left Ctrl along with right Alt)
 
 static bool isMod(UINT vk) {
   for (size_t i = 0; i < N_MODS; i++) if (kMods[i] == vk) return true;
@@ -1115,7 +1121,9 @@ static UINT charVk(wchar_t ch, UINT fallback) {
 // AutoHotkey hotkeys, a remap fires only with exactly its modifiers held.
 static bool runHotkey(UINT vk) {
   BYTE mods = (kLog[VK_LCONTROL] || kLog[VK_RCONTROL] ? KM_CTRL : 0) |
-              (kLog[VK_LMENU] || kLog[VK_RMENU] ? KM_ALT : 0) |
+              // Right Alt counts as Alt only on layouts without AltGr: AltGr keeps typing its
+              // characters (@ { [ ...) even when Alt+key is remapped.
+              (kLog[VK_LMENU] || (kLog[VK_RMENU] && !gAltGrDown) ? KM_ALT : 0) |
               (kLog[VK_LSHIFT] || kLog[VK_RSHIFT] ? KM_SHIFT : 0) |
               (kLog[VK_LWIN] || kLog[VK_RWIN] ? KM_WIN : 0);
   if (mods & KM_WIN) return false;
@@ -1155,8 +1163,8 @@ static LRESULT CALLBACK keyboardHook(int code, WPARAM wp, LPARAM lp) {
   UINT vk = kb->vkCode;
   bool down = !(kb->flags & LLKHF_UP);
   if (kb->dwExtraInfo == INPUT_MAGIC || vk >= 256) return CallNextHookEx(NULL, code, wp, lp);
-  // AltGr sends a fake left Ctrl along with right Alt: leave it alone.
-  if (vk == VK_LCONTROL && (kb->scanCode & 0x200)) return CallNextHookEx(NULL, code, wp, lp);
+  // AltGr sends a fake left Ctrl along with right Alt: leave it alone (but note it).
+  if (vk == VK_LCONTROL && (kb->scanCode & 0x200)) { gAltGrDown = down; return CallNextHookEx(NULL, code, wp, lp); }
 
   if (isMod(vk)) {
     kPhys[vk] = down;
@@ -2242,6 +2250,7 @@ static const char kHelpRemaps[] =
   "#         that has its own key on your keyboard layout, like < or ´ (+ is written Ctrl++)\n"
   "#   Keys containing # or : need quotes: \"Ctrl+#\": Delete\n"
   "#   In the keys you press, Ctrl also means the left Windows key, and Win can't be used.\n"
+  "#   Alt is the plain Alt key: AltGr always keeps typing its characters.\n"
   "#   A remap only happens with exactly those modifiers held: Ctrl+D isn't Ctrl+Shift+D.\n"
   "#   Delete keyRemaps to get the default remaps back; keyRemaps: {} turns them all off.\n"
   "#   Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"

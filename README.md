@@ -61,11 +61,13 @@ Shortcuts that send other keys instead. These are the defaults:
 | Keys | Result |
 |---|---|
 | Ctrl+D, Ctrl+Backspace | Delete |
-| Ctrl+2, 3, 4, 7, 8, 9, 0 | AltGr symbol on that key (`@ £ $ { [ ] }`) |
-| Ctrl+`<`, Ctrl+`´` | `\|` |
-| Ctrl+H | Win+M (minimise all) |
+| Ctrl+Shift+3 | Win+PrintScreen (screenshot, saved to Pictures) |
+| Ctrl+Shift+4 | Win+Shift+S (snip part of the screen) |
+| Ctrl+1, 2, 3, 4, 7, 8, 9, 0, `+`, `<` | The AltGr character on that key (such as `@ £ $ { [ ] } \ \|` on a Swedish layout) |
+| Ctrl+`´` | `\|` |
 | Ctrl+I | Ctrl+Shift+C |
-| Ctrl+Shift+7 | Alt+Shift+A |
+| Ctrl+`-` | Win+`-` (Magnifier: zoom out) |
+| Alt+1 … 9, 0, `+`, `-` | Ctrl+the same key (switch browser tabs, zoom, …) |
 
 "Ctrl" includes the left Windows key. A remap only fires with exactly those modifiers
 held, the way AutoHotkey hotkeys do: Ctrl+D doesn't fire for Ctrl+Shift+D. Modifiers that
@@ -90,7 +92,8 @@ keyRemaps:
   or `´` (the `+` key is written `Ctrl++`). Keys containing `#` or `:` need quotes:
   `"Ctrl+#": Delete`.
 - In the keys you press, `Ctrl` also means the left Windows key, and `Win` can't be used.
-  `Alt+W` is reserved for the Windows key.
+  `Alt+W` is reserved for the Windows key. `Alt` is the plain Alt key: AltGr always keeps
+  typing its characters, even when Alt with the same key is remapped.
 - An entry with a mistake is skipped, with a notification saying why; the others still
   work. Remove `keyRemaps` to get the defaults back; `keyRemaps: {}` turns them all off.
 
