@@ -141,9 +141,9 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
 
-## Debug log
+## Debug mode
 
-Tray icon → **Start debug log**, reproduce the problem, then **Finish debug log**: a
+Tray icon → **Start debug mode**, reproduce the problem, then **Finish debug mode**: a
 `Macify debug log <date>.txt` appears on the desktop. It starts with the app's state
 (Windows version, touchpad details, learned speed curve) followed by events: drags,
 filtered touchpad artefacts, cursor lag, learning, and remapped shortcuts and clicks.

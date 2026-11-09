@@ -150,7 +150,7 @@
 #define SAVE_INTERVAL_MS    30000
 
 // Debug log: off unless switched on from the tray menu; then lines are collected in
-// memory and saved to the desktop on "Finish debug log". Costs one check while off.
+// memory and saved to the desktop on "Finish debug mode". Costs one check while off.
 static volatile bool gDebugOn;
 static void debugLog(const char *fmt, ...);
 #define LOG(...) do { if (gDebugOn) debugLog(__VA_ARGS__); } while (0)
@@ -1329,20 +1329,23 @@ static void showTrayMenu(void) {
   else _snwprintf(status, 96, L"Pointer speed: %d of %d speed ranges learned", learned, LEARN_BINS);
   wchar_t title[48];
   _snwprintf(title, 48, L"Macify %hs", MACIFY_VERSION_STR);
-  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, title);
-  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);
+  wchar_t install[64];
+  _snwprintf(install, 64, L"Install Macify %hs", gPendingTag[0] == 'v' ? gPendingTag + 1 : gPendingTag);
+
+  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, title);       // name & version
+  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);      // pointer speed
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-  AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
   AppendMenuW(menu, MF_STRING | (gRunAtStartup ? MF_CHECKED : 0), ID_STARTUP, L"Run at startup");
   AppendMenuW(menu, MF_STRING | (gRunAsAdmin ? MF_CHECKED : 0), ID_ADMIN, L"Run as administrator");
   AppendMenuW(menu, MF_STRING | (gCheckUpdates ? MF_CHECKED : 0), ID_AUTOUPDATE, L"Check for updates on start");
-  AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
-  wchar_t install[64];
-  _snwprintf(install, 64, L"Install Macify %hs", gPendingTag[0] == 'v' ? gPendingTag + 1 : gPendingTag);
+  AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING | (gUpdateBusy ? MF_GRAYED : 0), ID_UPDATE,
               gPendingTag[0] ? install : gUpdateBusy ? L"Checking for updates..." : L"Check for updates");
+  AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
+  AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-  AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug log (save to desktop)" : L"Start debug log");
+  AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug mode (save log to desktop)" : L"Start debug mode");
+  AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit");
   SetForegroundWindow(gWnd);
   int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, p.x, p.y, 0, gWnd, NULL);
@@ -1877,8 +1880,8 @@ static void debugStart(void) {
   gDebugOn = true;
   LeaveCriticalSection(&gLogLock);
   logState();
-  trayNotify(L"Macify debug log started",
-             L"Reproduce the problem, then choose \"Finish debug log\" in this menu to save it to your desktop.");
+  trayNotify(L"Macify debug mode started",
+             L"Reproduce the problem, then choose \"Finish debug mode\" in this menu to save the log to your desktop.");
 }
 
 static void debugFinish(void) {
