@@ -9,7 +9,7 @@
 // Installing: run macify.exe from anywhere (e.g. Downloads). After one UAC prompt it copies
 // itself to C:\Program Files\Macify, registers the startup task for that copy and starts
 // it. Running a newer macify.exe the same way updates it: the running copy is closed and
-// replaced. (The debug build never installs.) It also keeps a "Macify" Start menu shortcut.
+// replaced. It also keeps a "Macify" Start menu shortcut.
 // Start with Windows as administrator: on first run (one UAC prompt) it registers a
 // scheduled task "Macify" that starts it elevated at logon. Whenever it is
 // started without admin rights while that task exists, it starts the task instead, so
@@ -67,6 +67,7 @@
 #include <hidusage.h>
 #include <hidpi.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,6 +120,7 @@
 #define INPUT_MAGIC 0x54464421  // dwExtraInfo on everything we inject, so our hooks ignore it
 #define ID_RELEARN 101
 #define ID_AUTOSTART 102
+#define ID_DEBUG 103
 
 // speed-curve learning
 #define LEARN_BINS          16
@@ -130,11 +132,13 @@
 #define SPEED_SMOOTH_MS     25.0    // smoothing of finger speed while dragging
 #define SAVE_INTERVAL_MS    30000
 
-#ifdef TFD_DEBUG
-#define LOG(...) do { printf(__VA_ARGS__); fflush(stdout); } while (0)
-#else
-#define LOG(...) do { } while (0)
-#endif
+// Debug log: off unless switched on from the tray menu; then lines are collected in
+// memory and saved to the desktop on "Finish debug log". Costs one check while off.
+static volatile bool gDebugOn;
+static void debugLog(const char *fmt, ...);
+#define LOG(...) do { if (gDebugOn) debugLog(__VA_ARGS__); } while (0)
+static void debugStart(void);
+static void debugFinish(void);
 
 typedef struct {
   ULONG id;
@@ -185,10 +189,8 @@ static volatile bool gPhysCtrl, gPhysAlt;  // physical Ctrl / Alt held (set by t
 static bool gDragRight;                 // current three-finger drag uses the right button
 static HANDLE gMutex;
 static UINT gQuitMsg;  // "MacifyQuit": a newer copy asks the running one to close
-#ifndef TFD_DEBUG
 static bool gAutostart;
 static void toggleAutostart(void);
-#endif
 
 static double gBinMm[LEARN_BINS], gBinPx[LEARN_BINS];
 static bool gCurveDirty;
@@ -508,14 +510,14 @@ static void moveCursor(double dxMm, double dyMm, double dtMs) {
 
   LONG ix = (LONG)lround(gCurX), iy = (LONG)lround(gCurY);
   if (ix == gSentX && iy == gSentY) return;
-#ifdef TFD_DEBUG
-  POINT actual;  // where Windows has the cursor vs. where we last put it
-  GetCursorPos(&actual);
-  if (labs(actual.x - gSentX) + labs(actual.y - gSentY) > 2)
-    LOG("  cursor is %ld,%ld px behind where we put it\n", gSentX - actual.x, gSentY - actual.y);
   LARGE_INTEGER t0, t1;
-  QueryPerformanceCounter(&t0);
-#endif
+  if (gDebugOn) {
+    POINT actual;  // where Windows has the cursor vs. where we last put it
+    GetCursorPos(&actual);
+    if (labs(actual.x - gSentX) + labs(actual.y - gSentY) > 2)
+      LOG("  cursor is %ld,%ld px behind where we put it\n", gSentX - actual.x, gSentY - actual.y);
+    QueryPerformanceCounter(&t0);
+  }
 
   int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
   int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -526,11 +528,11 @@ static void moveCursor(double dxMm, double dyMm, double dtMs) {
   in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
   in.mi.dwExtraInfo = INPUT_MAGIC;
   SendInput(1, &in, sizeof in);
-#ifdef TFD_DEBUG
-  QueryPerformanceCounter(&t1);
-  double sendMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)gFreq.QuadPart;
-  if (sendMs > 2) LOG("  moving the cursor took %.1f ms\n", sendMs);
-#endif
+  if (gDebugOn) {
+    QueryPerformanceCounter(&t1);
+    double sendMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)gFreq.QuadPart;
+    if (sendMs > 2) LOG("  moving the cursor took %.1f ms\n", sendMs);
+  }
   gSentX = ix; gSentY = iy;
 }
 
@@ -1125,7 +1127,17 @@ static void trayRefreshIcon(void) {
   if (old) DestroyIcon(old);
 }
 
+static void trayNotify(const wchar_t *title, const wchar_t *text) {
+  gNid.uFlags |= NIF_INFO;
+  wcsncpy(gNid.szInfoTitle, title, 63);
+  wcsncpy(gNid.szInfo, text, 255);
+  gNid.dwInfoFlags = NIIF_INFO;
+  Shell_NotifyIconW(NIM_MODIFY, &gNid);
+  gNid.uFlags &= ~NIF_INFO;
+}
+
 static void quit(void) {
+  if (gDebugOn) debugFinish();  // don't lose a log in progress
   endDrag();
   if (gCurveDirty) curveSave();
   Shell_NotifyIconW(NIM_DELETE, &gNid);
@@ -1146,24 +1158,22 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
-#ifndef TFD_DEBUG
   AppendMenuW(menu, MF_STRING | (gAutostart ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows as administrator");
-#endif
+  AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+  AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug log (save to desktop)" : L"Start debug log");
   AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit");
   SetForegroundWindow(gWnd);
   int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, p.x, p.y, 0, gWnd, NULL);
   PostMessageW(gWnd, WM_NULL, 0, 0);
   DestroyMenu(menu);
   if (cmd == ID_RELEARN) { curveClear(); curveSave(); }
-#ifndef TFD_DEBUG
   if (cmd == ID_AUTOSTART) toggleAutostart();
-#endif
+  if (cmd == ID_DEBUG) { if (gDebugOn) debugFinish(); else debugStart(); }
   if (cmd == ID_QUIT) quit();
 }
 
 // ---------------------------------------------------------------- start menu & elevation
 
-#ifndef TFD_DEBUG
 static void ensureStartMenuShortcut(void) {
   wchar_t exe[MAX_PATH], dir[MAX_PATH], lnk[MAX_PATH];
   if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
@@ -1470,7 +1480,144 @@ static void toggleAutostart(void) {
     if (startTask()) quit();
   }
 }
-#endif
+
+// ---------------------------------------------------------------- debug log
+//
+// Records what Macify does (touchpad detection, drags, filtered jumps, learning, remapped
+// shortcuts and clicks), never what you type: only remapped shortcuts are logged.
+
+#define LOG_MAX_BYTES (16u << 20)
+static CRITICAL_SECTION gLogLock;
+static char *gLog;
+static size_t gLogLen, gLogCap;
+static bool gLogFull;
+static LARGE_INTEGER gLogStart;
+
+static void debugLog(const char *fmt, ...) {  // may be called from both threads
+  char line[512];
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  int n = snprintf(line, sizeof line, "[%9.3f] ",
+                   (double)(now.QuadPart - gLogStart.QuadPart) / (double)gFreq.QuadPart);
+  va_list ap;
+  va_start(ap, fmt);
+  int m = vsnprintf(line + n, sizeof line - n, fmt, ap);
+  va_end(ap);
+  if (m < 0) return;
+  size_t len = (size_t)n + (size_t)m;
+  if (len > sizeof line - 1) len = sizeof line - 1;
+
+  EnterCriticalSection(&gLogLock);
+  if (gDebugOn && !gLogFull) {
+    if (gLogLen + len + 64 > LOG_MAX_BYTES) {
+      const char *full = "... log full, nothing further recorded\n";
+      memcpy(gLog + gLogLen, full, strlen(full));
+      gLogLen += strlen(full);
+      gLogFull = true;
+    } else {
+      if (gLogLen + len > gLogCap) {
+        size_t cap = gLogCap ? gLogCap * 2 : (256u << 10);
+        while (cap < gLogLen + len) cap *= 2;
+        if (cap > LOG_MAX_BYTES) cap = LOG_MAX_BYTES;
+        char *grown = realloc(gLog, cap);
+        if (!grown) { LeaveCriticalSection(&gLogLock); return; }
+        gLog = grown;
+        gLogCap = cap;
+      }
+      memcpy(gLog + gLogLen, line, len);
+      gLogLen += len;
+    }
+  }
+  LeaveCriticalSection(&gLogLock);
+}
+
+static void logRegString(const char *label, const wchar_t *name) {
+  wchar_t v[128];
+  DWORD size = sizeof v;
+  if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", name,
+                   RRF_RT_REG_SZ, NULL, v, &size) == ERROR_SUCCESS)
+    LOG("%s: %ls\n", label, v);
+}
+
+// Everything worth knowing at the start of a log.
+static void logState(void) {
+  SYSTEMTIME t;
+  GetLocalTime(&t);
+  LOG("Macify %s debug log, started %04d-%02d-%02d %02d:%02d:%02d\n", MACIFY_VERSION_STR,
+      t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+  logRegString("Windows", L"ProductName");
+  logRegString("Windows version", L"DisplayVersion");
+  logRegString("Windows build", L"CurrentBuild");
+  LOG("admin rights: %s, installed copy: %s, start with Windows: %s\n", isElevated() ? "yes" : "no",
+      isInstalledCopy() ? "yes" : "no", gAutostart ? "on" : "off");
+  LOG("pointer settings: touchpad cursor speed %d, mouse speed %d, enhance precision %d\n",
+      gSettingsSig[0], gSettingsSig[1], gSettingsSig[2]);
+  HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+  LOG("keyboard layout: %08lx\n", (unsigned long)(ULONG_PTR)hkl);
+  int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  LOG("screens: %d monitor(s), desktop %d,%d %dx%d px, system DPI %u\n", GetSystemMetrics(SM_CMONITORS),
+      vx, vy, GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN), GetDpiForSystem());
+  if (gDeviceCount == 0) LOG("touchpads: none seen yet (touch the touchpad)\n");
+  for (int i = 0; i < gDeviceCount; i++) {
+    Device *d = &gDevices[i];
+    int conf = 0;
+    for (int k = 0; k < d->slotCount; k++) conf += d->slotHasConfidence[k];
+    LOG("touchpad %d: %s, %d contact slot(s), contact count %s, palm flags on %d slot(s), %.4f x %.4f mm/unit\n",
+        i, d->usable ? "usable" : "NOT usable", d->slotCount, d->hasCount ? "yes" : "no", conf,
+        d->mmPerUnitX, d->mmPerUnitY);
+  }
+  LOG("speed curve (%d/%d ranges learned):\n", learnedBins(), LEARN_BINS);
+  for (int b = 0; b < LEARN_BINS; b++)
+    if (gBinMm[b] > 0)
+      LOG("  %6.1f mm/s: %6.2f px/mm from %.0f mm of movement\n", binSpeed(b), gBinPx[b] / gBinMm[b], gBinMm[b]);
+  LOG("--- events ---\n");
+}
+
+static void debugStart(void) {
+  EnterCriticalSection(&gLogLock);
+  free(gLog);
+  gLog = NULL;
+  gLogLen = gLogCap = 0;
+  gLogFull = false;
+  QueryPerformanceCounter(&gLogStart);
+  gDebugOn = true;
+  LeaveCriticalSection(&gLogLock);
+  logState();
+  trayNotify(L"Macify debug log started",
+             L"Reproduce the problem, then choose \"Finish debug log\" in this menu to save it to your desktop.");
+}
+
+static void debugFinish(void) {
+  LOG("--- finished ---\n");
+  EnterCriticalSection(&gLogLock);
+  gDebugOn = false;
+  char *log = gLog;
+  size_t len = gLogLen;
+  gLog = NULL;
+  gLogLen = gLogCap = 0;
+  LeaveCriticalSection(&gLogLock);
+
+  wchar_t *desktop = NULL, path[MAX_PATH], name[64];
+  SYSTEMTIME t;
+  GetLocalTime(&t);
+  _snwprintf(name, 64, L"Macify debug log %04d-%02d-%02d %02d.%02d.%02d.txt",
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+  bool saved = false;
+  if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Desktop, 0, NULL, &desktop))) {
+    _snwprintf(path, MAX_PATH, L"%ls\\%ls", desktop, name);
+    FILE *f = _wfopen(path, L"wb");
+    if (f) {
+      saved = fwrite(log ? log : "", 1, len, f) == len;
+      fclose(f);
+    }
+    CoTaskMemFree(desktop);
+  }
+  free(log);
+  wchar_t text[256];
+  if (saved) _snwprintf(text, 256, L"Saved to your desktop as \"%ls\".", name);
+  else _snwprintf(text, 256, L"The log couldn't be saved to your desktop.");
+  trayNotify(saved ? L"Macify debug log saved" : L"Macify debug log not saved", text);
+}
 
 // ---------------------------------------------------------------- window plumbing
 
@@ -1500,11 +1647,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     default:
       if (msg == gTaskbarCreated && gTaskbarCreated) { trayAdd(); return 0; }  // Explorer restarted
       if (msg == gQuitMsg && gQuitMsg) {  // a newer copy is being installed
-#ifndef TFD_DEBUG
         quit();
-#else
-        DestroyWindow(gWnd);
-#endif
         return 0;
       }
   }
@@ -1522,13 +1665,12 @@ static void migrateOldData(void) {
 }
 
 static int run(void) {
-#ifndef TFD_DEBUG
+  InitializeCriticalSection(&gLogLock);
   int argc = 0;
   LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (argv && argc >= 2 && wcscmp(argv[1], L"--install") == 0)
     return installTask(argc >= 3 ? argv[2] : NULL, argc >= 4 ? wcstoul(argv[3], NULL, 10) : 0);
   if (argv && argc >= 2 && wcscmp(argv[1], L"--uninstall") == 0) return uninstallTask();
-#endif
 
   // The old version (before the rename) still running would fight over the same input.
   HANDLE old = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\" OLD_NAME);
@@ -1542,7 +1684,6 @@ static int run(void) {
   migrateOldData();
   gQuitMsg = RegisterWindowMessageW(L"MacifyQuit");
 
-#ifndef TFD_DEBUG
   // Started from anywhere but Program Files (a download, a fresh build): install or update.
   // Also when the installed copy finds its startup task missing.
   if (!isElevated() && !autostartOptedOut() && !(isInstalledCopy() && autostartInstalled())) {
@@ -1560,21 +1701,15 @@ static int run(void) {
       return 0;
     }
   }
-#endif
 
   HANDLE mutex = CreateMutexW(NULL, TRUE, L"Local\\Macify");
   gMutex = mutex;
   DWORD err = GetLastError();
   // ACCESS_DENIED: an elevated instance already holds it.
-  LOG("Macify %s debug build starting\n", MACIFY_VERSION_STR);
   if ((mutex && err == ERROR_ALREADY_EXISTS) || (!mutex && err == ERROR_ACCESS_DENIED)) {
-    LOG("Another copy is already running%s. Quit it from its tray icon (or run\n"
-        "'taskkill /f /im macify.exe' in an admin terminal), then start this again.\n",
-        err == ERROR_ACCESS_DENIED ? " as administrator" : "");
     return 0;
   }
 
-#ifndef TFD_DEBUG
   gAutostart = autostartInstalled();
   if (!isElevated() && gAutostart && isInstalledCopy()) {  // e.g. started from the Start menu
     if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }    // let the admin instance take over
@@ -1582,7 +1717,6 @@ static int run(void) {
     // couldn't start the task: carry on without admin rights
   }
   ensureStartMenuShortcut();
-#endif
 
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
@@ -1621,17 +1755,11 @@ static int run(void) {
   SetTimer(gWnd, TIMER_SAVE, SAVE_INTERVAL_MS, NULL);
   gIcon = makeIcon();
   trayAdd();
-#ifndef TFD_DEBUG
   if (justInstalled()) {
     markJustInstalled(false);
-    gNid.uFlags |= NIF_INFO;
-    wcscpy(gNid.szInfoTitle, L"Macify is installed and running");
-    wcscpy(gNid.szInfo, L"It starts with Windows from now on. Its menu is behind this icon in the system tray.");
-    gNid.dwInfoFlags = NIIF_INFO;
-    Shell_NotifyIconW(NIM_MODIFY, &gNid);
-    gNid.uFlags &= ~NIF_INFO;
+    trayNotify(L"Macify is installed and running",
+               L"It starts with Windows from now on. Its menu is behind this icon in the system tray.");
   }
-#endif
 
   MSG m;
   while (GetMessageW(&m, NULL, 0, 0) > 0) {
@@ -1647,11 +1775,7 @@ static int run(void) {
   return 0;
 }
 
-#ifdef TFD_DEBUG
-int wmain(void) { return run(); }
-#else
 int WINAPI wWinMain(HINSTANCE a, HINSTANCE b, PWSTR c, int d) {
   (void)a; (void)b; (void)c; (void)d;
   return run();
 }
-#endif

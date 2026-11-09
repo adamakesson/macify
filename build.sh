@@ -8,5 +8,4 @@ FLAGS='-O2 -s -static -municode -Wall -Wextra'
 LIBS='-lhid -luser32 -lshell32 -lgdi32 -ladvapi32 -lole32 -luuid'
 x86_64-w64-mingw32-windres app.rc -O coff -o app-res.o
 $CC $FLAGS -mwindows macify.c app-res.o -o macify.exe $LIBS
-$CC $FLAGS -mconsole -DTFD_DEBUG macify.c app-res.o -o macify-debug.exe $LIBS
 rm -f app-res.o
