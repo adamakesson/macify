@@ -701,8 +701,20 @@ static void processFrame(const Contact *all, int n, int scanTime) {
 
   Contact active[MAX_CONTACTS];
   int count = 0;
-  for (int i = 0; i < n; i++)
+  int touching = 0;
+  for (int i = 0; i < n; i++) {
+    if (all[i].tip) touching++;
     if (all[i].tip && all[i].confident) active[count++] = all[i];
+  }
+  // Debug log: how many fingers the touchpad reports, and how many it flags as a possible
+  // palm (those are ignored, as Windows does), whenever that changes.
+  static int lastTouching = -1, lastCount = -1;
+  if (touching != lastTouching || count != lastCount) {
+    if (touching != count) LOG("touchpad: %d touching, %d flagged as a possible palm\n", touching, touching - count);
+    else LOG("touchpad: %d touching\n", touching);
+    lastTouching = touching;
+    lastCount = count;
+  }
 
   double nowMs = (double)now.QuadPart * 1000.0 / (double)gFreq.QuadPart;
   if (!sameFingers(active, count, gPrev, gPrevCount)) {
