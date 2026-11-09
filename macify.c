@@ -33,7 +33,8 @@
 // Keyboard and mouse remaps (replace an AutoHotkey script; see "remaps" below):
 //   Left Win acts as Ctrl. Ctrl+D / Ctrl+Backspace = Delete. Ctrl+2/3/4/7/8/9/0 and
 //   Ctrl+< / Ctrl+´ = the AltGr symbol on that key. Ctrl+H = Win+M. Ctrl+I = Ctrl+Shift+C.
-//   Ctrl+Shift+7 = Alt+Shift+A. Physical Ctrl or Alt + click = plain right-click, and a
+//   Ctrl+Shift+7 = Alt+Shift+A. Left Alt+W = the Windows key (Start).
+//   Physical Ctrl or Alt + click = plain right-click, and a
 //   three-finger drag started with Ctrl or Alt held is a right-button drag.
 //
 // Earlier versions were called three-finger-drag: their settings, startup task and
@@ -888,15 +889,20 @@ static void updatePhysFlags(void) {
 
 // Hide Ctrl and Alt from apps (for a remapped click). They stay hidden until released,
 // or until another key needs them (then they are pressed again first).
-static void liftForRightClick(void) {
-  const UINT lift[] = { VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU };
+// Hides the given modifiers from apps until they're released (or another key needs them).
+static void hideModifiers(const UINT *mods, int n) {
   // Releasing Alt right after pressing it would open the window's menu bar. A dummy key
   // in between (unassigned vk E8, as AutoHotkey does) prevents that.
   if (kLog[VK_LMENU] || kLog[VK_RMENU]) { sendKey(0xE8, true); sendKey(0xE8, false); }
-  for (int i = 0; i < 4; i++) {
-    if (kLog[lift[i]]) sendKey(lift[i], false);
-    if (wantDown(lift[i])) kSup[lift[i]] = true;
+  for (int i = 0; i < n; i++) {
+    if (kLog[mods[i]]) sendKey(mods[i], false);
+    if (wantDown(mods[i])) kSup[mods[i]] = true;
   }
+}
+
+static void liftForRightClick(void) {
+  const UINT mods[] = { VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU };
+  hideModifiers(mods, 4);
 }
 
 // Returns true if anything had to be pressed again (the triggering event must then be
@@ -941,6 +947,15 @@ static bool runHotkey(UINT vk) {
   bool alt = kLog[VK_LMENU] || kLog[VK_RMENU];
   bool shift = kLog[VK_LSHIFT] || kLog[VK_RSHIFT];
   bool win = kLog[VK_LWIN] || kLog[VK_RWIN];
+  // Left Alt+W: a tap of the Windows key (opens Start). Alt is hidden for the rest of the
+  // press, so releasing it can't activate a menu bar. Right Alt is AltGr: left alone.
+  if (vk == 'W' && kLog[VK_LMENU] && !kLog[VK_RMENU] && !ctrl && !shift && !win) {
+    const UINT alts[] = { VK_LMENU };
+    hideModifiers(alts, 1);
+    sendKey(VK_LWIN, true);
+    sendKey(VK_LWIN, false);
+    return true;
+  }
   if (!ctrl || alt || win) return false;  // like AutoHotkey: exactly these modifiers
 
   UINT lessVk = charVk(L'<', VK_OEM_102), acuteVk = charVk(L'´', VK_OEM_4);

@@ -56,6 +56,7 @@ log and quit.
 | Ctrl+H | Win+M (minimise all) |
 | Ctrl+I | Ctrl+Shift+C |
 | Ctrl+Shift+7 | Alt+Shift+A |
+| Left Alt+W | Windows key (opens Start) |
 | Ctrl+click or Alt+click | right-click (physical Ctrl key only; Win+click stays Ctrl+click) |
 
 "Ctrl" includes the left Win key. Each shortcut fires only with exactly those modifiers
