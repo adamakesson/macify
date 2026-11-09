@@ -45,10 +45,14 @@
 //
 // Settings file: %APPDATA%\Macify\settings.json (tray menu > Edit settings), created
 // with the defaults, picked up as soon as it is saved:
-//   "threeFingerDragAsOneFinger": false  true: the cursor follows whichever finger moves
-//                                        the most, like ThreeFingerDragOnWindows; false:
-//                                        it follows the centre of the fingers (macOS)
-//   "threeFingerDragSpeed": 1.0          multiplies the three-finger drag speed
+//   "runAtStartup": true                start Macify when you log in
+//   "runAsAdministrator": true          run with admin rights (so it also works in admin
+//                                       windows) via a scheduled task, without prompts
+//   "threeFingerDragAsOneFinger": true  true: the fingers move the cursor together, as
+//                                       one (their centre, like macOS); false: the cursor
+//                                       follows whichever finger moves the most, like
+//                                       ThreeFingerDragOnWindows
+//   "threeFingerDragSpeed": 1.0         multiplies the three-finger drag speed
 //
 // Pointer speed is learned, not configured: while you use one finger normally, the app
 // compares how far (and how fast) your finger moved with how far Windows moved the
@@ -128,7 +132,8 @@
 #define WM_HOOK_LIFT (WM_APP + 3)
 #define INPUT_MAGIC 0x54464421  // dwExtraInfo on everything we inject, so our hooks ignore it
 #define ID_RELEARN 101
-#define ID_AUTOSTART 102
+#define ID_STARTUP 102
+#define ID_ADMIN 106
 #define ID_DEBUG 103
 #define ID_SETTINGS 104
 #define ID_UPDATE 105
@@ -153,6 +158,9 @@ static void debugLog(const char *fmt, ...);
 static void debugStart(void);
 static void debugFinish(void);
 static void settingsEdit(void);
+static void settingsLoad(bool userEdit);
+static void settingsWrite(void);
+static void quit(void);
 static void updateCheck(void);
 static volatile bool gUpdateBusy;
 
@@ -205,15 +213,16 @@ static volatile bool gPhysCtrl, gPhysAlt;  // physical Ctrl / Alt held (set by t
 static bool gDragRight;                 // current three-finger drag uses the right button
 static HANDLE gMutex;
 static UINT gQuitMsg;  // "MacifyQuit": a newer copy asks the running one to close
-static bool gAutostart;
-static void toggleAutostart(void);
+static void toggleSetting(bool *value);
 
 static double gBinMm[LEARN_BINS], gBinPx[LEARN_BINS];
 static bool gCurveDirty;
 static int gSettingsSig[3];
 static double gDragSpeed;
 static double gSettleUntilMs;
-static bool gAsOneFinger = false;  // settings.json: threeFingerDragAsOneFinger
+static bool gAsOneFinger = true;   // settings.json: threeFingerDragAsOneFinger
+static bool gRunAtStartup = true;  // settings.json: runAtStartup
+static bool gRunAsAdmin = true;    // settings.json: runAsAdministrator
 static double gSpeedMul = 1.0;     // settings.json: threeFingerDragSpeed
 static int gLastScan = -1;
 static bool gVelValid, gHolding;
@@ -705,8 +714,8 @@ static void processFrame(const Contact *all, int n, int scanTime) {
   }
   bool settling = nowMs < gSettleUntilMs;
 
-  // Movement of the group's centre: average of each finger's movement. Or, with
-  // threeFingerDragAsOneFinger, the movement of the finger that moved most.
+  // threeFingerDragAsOneFinger: movement of the group's centre (average of each finger's
+  // movement). Otherwise the movement of the finger that moved most.
   double dx = 0, dy = 0;
   int used = 0;
   if (!settling && count > 0 && count == gPrevCount) {
@@ -717,19 +726,19 @@ static void processFrame(const Contact *all, int n, int scanTime) {
       fx[i] = sx[i] = active[i].x - gPrev[perm[i]].x;
       fy[i] = sy[i] = active[i].y - gPrev[perm[i]].y;
     }
-    if (gAsOneFinger) {
+    if (!gAsOneFinger) {
       double best = -1;
       for (int i = 0; i < count; i++)
         if (hypot(fx[i], fy[i]) > best) { best = hypot(fx[i], fy[i]); dx = fx[i]; dy = fy[i]; }
       used = count;
     }
     double mx = 0, my = 0, limit = INFINITY;
-    if (!gAsOneFinger && count >= 3) {  // with three or more fingers the median tells us what the hand did
+    if (gAsOneFinger && count >= 3) {  // with three or more fingers the median tells us what the hand did
       mx = median(sx, count);
       my = median(sy, count);
       limit = OUTLIER_MM + 0.5 * hypot(mx, my);
     }
-    for (int i = 0; i < count && !gAsOneFinger; i++) {
+    for (int i = 0; i < count && gAsOneFinger; i++) {
       if (hypot(fx[i] - mx, fy[i] - my) > limit) {
         LOG("ignored finger moving %.1fmm against the others\n", hypot(fx[i] - mx, fy[i] - my));
         continue;
@@ -738,7 +747,7 @@ static void processFrame(const Contact *all, int n, int scanTime) {
       dy += fy[i];
       used++;
     }
-    if (used && !gAsOneFinger) { dx /= used; dy /= used; }
+    if (used && gAsOneFinger) { dx /= used; dy /= used; }
   }
   if (used && count == DRAG_FINGERS && (gState == ARMED || gState == DRAGGING)) {
     double rx = dx, ry = dy;
@@ -1183,7 +1192,8 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
-  AppendMenuW(menu, MF_STRING | (gAutostart ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows as administrator");
+  AppendMenuW(menu, MF_STRING | (gRunAtStartup ? MF_CHECKED : 0), ID_STARTUP, L"Run at startup");
+  AppendMenuW(menu, MF_STRING | (gRunAsAdmin ? MF_CHECKED : 0), ID_ADMIN, L"Run as administrator");
   AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
   AppendMenuW(menu, MF_STRING | (gUpdateBusy ? MF_GRAYED : 0), ID_UPDATE,
               gUpdateBusy ? L"Checking for updates..." : L"Check for updates");
@@ -1195,7 +1205,8 @@ static void showTrayMenu(void) {
   PostMessageW(gWnd, WM_NULL, 0, 0);
   DestroyMenu(menu);
   if (cmd == ID_RELEARN) { curveClear(); curveSave(); }
-  if (cmd == ID_AUTOSTART) toggleAutostart();
+  if (cmd == ID_STARTUP) toggleSetting(&gRunAtStartup);
+  if (cmd == ID_ADMIN) toggleSetting(&gRunAsAdmin);
   if (cmd == ID_SETTINGS) settingsEdit();
   if (cmd == ID_UPDATE) updateCheck();
   if (cmd == ID_DEBUG) { if (gDebugOn) debugFinish(); else debugStart(); }
@@ -1291,38 +1302,50 @@ static bool writeUtf16(const wchar_t *path, const wchar_t *text) {
   return ok;
 }
 
-// autostart.txt holds the exe path the task was registered for.
-static bool markerMatches(const wchar_t *exe) {
-  wchar_t path[MAX_PATH], buf[MAX_PATH + 1] = { 0 };
-  if (!dataFile(path, L"autostart.txt")) return false;
+// task.txt records what the startup task was registered for ("<exe>|<at startup 0/1>"),
+// so it is only re-registered (which needs admin rights) when something changed.
+static bool taskMarkerMatches(const wchar_t *exe, bool startup) {
+  wchar_t path[MAX_PATH], buf[MAX_PATH + 8] = { 0 }, want[MAX_PATH + 8];
+  if (!dataFile(path, L"task.txt")) return false;
   FILE *f = _wfopen(path, L"rb");
   if (!f) return false;
   BYTE bom[2];
   size_t ok = fread(bom, 1, 2, f);
-  size_t n = ok == 2 ? fread(buf, sizeof(wchar_t), MAX_PATH, f) : 0;
+  size_t n = ok == 2 ? fread(buf, sizeof(wchar_t), MAX_PATH + 7, f) : 0;
   fclose(f);
   buf[n] = 0;
-  return _wcsicmp(buf, exe) == 0;
+  _snwprintf(want, MAX_PATH + 8, L"%ls|%d", exe, startup ? 1 : 0);
+  return _wcsicmp(buf, want) == 0;
 }
 
-static void setMarker(const wchar_t *exe) {
+static void setTaskMarker(const wchar_t *exe, bool startup) {
+  wchar_t path[MAX_PATH], text[MAX_PATH + 8];
+  if (!dataFile(path, L"task.txt")) return;
+  if (!exe) { DeleteFileW(path); return; }
+  _snwprintf(text, MAX_PATH + 8, L"%ls|%d", exe, startup ? 1 : 0);
+  writeUtf16(path, text);
+}
+
+// install-declined: the UAC prompt to install was answered No; don't ask on every start.
+static bool installDeclined(void) {
   wchar_t path[MAX_PATH];
-  if (!dataFile(path, L"autostart.txt")) return;
-  if (exe) writeUtf16(path, exe);
+  return dataFile(path, L"install-declined") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void setInstallDeclined(bool declined) {
+  wchar_t path[MAX_PATH];
+  if (!dataFile(path, L"install-declined")) return;
+  if (declined) writeUtf16(path, L"Delete this file to be offered the install again.");
   else DeleteFileW(path);
 }
 
-// autostart-off: the user said no (UAC declined or switched off), so don't ask on start.
-static bool autostartOptedOut(void) {
-  wchar_t path[MAX_PATH];
-  return dataFile(path, L"autostart-off") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-}
-
-static void setOptedOut(bool off) {
-  wchar_t path[MAX_PATH];
-  if (!dataFile(path, L"autostart-off")) return;
-  if (off) writeUtf16(path, L"Delete this file to be asked about starting with Windows again.");
-  else DeleteFileW(path);
+// Starting at login without admin rights: the usual per-user "Run" registry entry.
+static void setRunEntry(const wchar_t *exe) {
+  const wchar_t *key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+  if (!exe) { RegDeleteKeyValueW(HKEY_CURRENT_USER, key, L"Macify"); return; }
+  wchar_t cmd[MAX_PATH + 4];
+  _snwprintf(cmd, MAX_PATH + 4, L"\"%ls\"", exe);
+  RegSetKeyValueW(HKEY_CURRENT_USER, key, L"Macify", REG_SZ, cmd, (DWORD)((wcslen(cmd) + 1) * sizeof(wchar_t)));
 }
 
 static void xmlEscape(const wchar_t *in, wchar_t *out, size_t n) {
@@ -1373,25 +1396,19 @@ static bool stopRunningInstance(DWORD skipPid) {
   return false;
 }
 
-// Runs elevated (--install): copies this exe to Program Files and registers the logon task. Unlike a plain schtasks /create,
-// the XML also lets it run on battery and without the default 3-day time limit.
-static int installTask(const wchar_t *user, DWORD callerPid) {
-  wchar_t exe[MAX_PATH], dir[MAX_PATH], eExe[MAX_PATH * 2], eDir[MAX_PATH * 2], eUser[512], fallback[512];
-  if (!exePath(exe, dir)) return 1;
-  wchar_t target[MAX_PATH], targetDir[MAX_PATH];
-  if (!installedPath(target, targetDir)) return 1;
-  CreateDirectoryW(targetDir, NULL);
-  if (_wcsicmp(exe, target) != 0) {  // install or update the copy in Program Files
-    stopRunningInstance(callerPid);  // the running copy keeps its exe locked
-    bool copied = false;
-    for (int i = 0; i < 40 && !copied; i++) {  // the previous copy may take a moment to exit
-      copied = CopyFileW(exe, target, FALSE);
-      if (!copied) Sleep(250);
-    }
-    if (!copied) return 2;
-  }
-  wcscpy(exe, target);
-  wcscpy(dir, targetDir);
+static bool taskExists(void) { return runHidden(L"/query /tn " TASK_NAME) == 0; }
+
+static int deleteTask(void) {
+  runHidden(L"/delete /tn " OLD_NAME L" /f");  // startup task from before the rename
+  if (!taskExists()) return 0;
+  return runHidden(L"/delete /tn " TASK_NAME L" /f") == 0 ? 0 : 1;
+}
+
+// Needs admin rights. Registers the "Macify" task that starts exe with admin rights: at
+// login if startup, otherwise only when started on demand (from the Start menu). Unlike a
+// plain schtasks /create, the XML also lets it run on battery and without a time limit.
+static int registerTask(const wchar_t *exe, const wchar_t *dir, bool startup, const wchar_t *user) {
+  wchar_t eExe[MAX_PATH * 2], eDir[MAX_PATH * 2], eUser[512], fallback[512], trigger[700];
   if (!user || !*user) {
     const wchar_t *d = _wgetenv(L"USERDOMAIN"), *u = _wgetenv(L"USERNAME");
     if (!d || !u) return 1;
@@ -1401,13 +1418,15 @@ static int installTask(const wchar_t *user, DWORD callerPid) {
   xmlEscape(exe, eExe, MAX_PATH * 2);
   xmlEscape(dir, eDir, MAX_PATH * 2);
   xmlEscape(user, eUser, 512);
+  if (startup) _snwprintf(trigger, 700, L"<LogonTrigger><Enabled>true</Enabled><UserId>%ls</UserId></LogonTrigger>", eUser);
+  else trigger[0] = 0;
 
   static wchar_t xml[8192];
   _snwprintf(xml, 8192,
     L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
     L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
-    L"  <RegistrationInfo><Description>Macify, started with admin rights so it also works on admin windows.</Description></RegistrationInfo>\r\n"
-    L"  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%ls</UserId></LogonTrigger></Triggers>\r\n"
+    L"  <RegistrationInfo><Description>Starts Macify with admin rights, so it also works in admin windows.</Description></RegistrationInfo>\r\n"
+    L"  <Triggers>%ls</Triggers>\r\n"
     L"  <Principals><Principal id=\"Author\"><UserId>%ls</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n"
     L"  <Settings>\r\n"
     L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
@@ -1420,7 +1439,7 @@ static int installTask(const wchar_t *user, DWORD callerPid) {
     L"    <Priority>4</Priority>\r\n"
     L"  </Settings>\r\n"
     L"  <Actions Context=\"Author\"><Exec><Command>%ls</Command><WorkingDirectory>%ls</WorkingDirectory></Exec></Actions>\r\n"
-    L"</Task>\r\n", eUser, eUser, eExe, eDir);
+    L"</Task>\r\n", trigger, eUser, eExe, eDir);
 
   wchar_t tmp[MAX_PATH], file[MAX_PATH], args[MAX_PATH + 64];
   GetTempPathW(MAX_PATH, tmp);
@@ -1429,18 +1448,37 @@ static int installTask(const wchar_t *user, DWORD callerPid) {
   _snwprintf(args, MAX_PATH + 64, L"/create /tn " TASK_NAME L" /xml \"%ls\" /f", file);
   DWORD code = runHidden(args);
   DeleteFileW(file);
-  if (code == 0) runHidden(L"/delete /tn " OLD_NAME L" /f");  // startup task from before the rename
+  if (code == 0) runHidden(L"/delete /tn " OLD_NAME L" /f");
   return code == 0 ? 0 : 1;
 }
 
-static int uninstallTask(void) {
-  return runHidden(L"/delete /tn " TASK_NAME L" /f") == 0 ? 0 : 1;
+// Needs admin rights: makes the task match settings.json for the installed copy.
+static int configureTask(const wchar_t *user) {
+  wchar_t target[MAX_PATH], targetDir[MAX_PATH];
+  if (!installedPath(target, targetDir)) return 1;
+  settingsLoad(false);
+  return gRunAsAdmin ? registerTask(target, targetDir, gRunAtStartup, user) : deleteTask();
 }
 
-static bool autostartInstalled(void) {
-  wchar_t exe[MAX_PATH], dir[MAX_PATH];
-  if (!exePath(exe, dir) || !markerMatches(exe)) return false;  // never set up, or the exe moved
-  return runHidden(L"/query /tn " TASK_NAME) == 0;              // task deleted by hand?
+// Runs elevated (--install): copies this exe to Program Files (closing the running copy,
+// which keeps it locked) and sets up the task as settings.json says.
+static int installTask(const wchar_t *user, DWORD callerPid) {
+  wchar_t exe[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], targetDir[MAX_PATH], stream[MAX_PATH + 20];
+  if (!exePath(exe, dir) || !installedPath(target, targetDir)) return 1;
+  CreateDirectoryW(targetDir, NULL);
+  if (_wcsicmp(exe, target) != 0) {
+    stopRunningInstance(callerPid);
+    bool copied = false;
+    for (int i = 0; i < 40 && !copied; i++) {  // the previous copy may take a moment to exit
+      copied = CopyFileW(exe, target, FALSE);
+      if (!copied) Sleep(250);
+    }
+    if (!copied) return 2;
+    // Drop the "downloaded from the internet" mark, so starting it never shows a warning.
+    _snwprintf(stream, MAX_PATH + 20, L"%ls:Zone.Identifier", target);
+    DeleteFileW(stream);
+  }
+  return configureTask(user);
 }
 
 // Runs this exe with admin rights (UAC prompt unless already elevated) and waits for it.
@@ -1463,19 +1501,32 @@ static int runElevated(const wchar_t *params) {
   return (int)code;
 }
 
-// 0: installed, -1: UAC prompt declined, other: failed
-static int installViaUac(void) {
-  wchar_t exe[MAX_PATH], dir[MAX_PATH], params[600];
+static void userParam(wchar_t *out, size_t n) {
   const wchar_t *d = _wgetenv(L"USERDOMAIN"), *u = _wgetenv(L"USERNAME");
-  if (!exePath(exe, dir) || !d || !u) return 1;
-  // Pass our user along, in case the UAC prompt was answered with another admin account.
-  _snwprintf(params, 600, L"--install \"%ls\\%ls\" %lu", d, u, GetCurrentProcessId());
+  // Passed along in case the UAC prompt is answered with another admin account.
+  if (d && u) _snwprintf(out, n, L"\"%ls\\%ls\"", d, u);
+  else _snwprintf(out, n, L"\"\"");
+}
+
+// 0: done, -1: UAC prompt declined, other: failed
+static int installViaUac(void) {
+  wchar_t user[300], params[400], target[MAX_PATH], targetDir[MAX_PATH];
+  userParam(user, 300);
+  _snwprintf(params, 400, L"--install %ls %lu", user, GetCurrentProcessId());
   int code = runElevated(params);
   if (code != 0) return code;
-  wchar_t target[MAX_PATH], targetDir[MAX_PATH];
-  if (installedPath(target, targetDir)) setMarker(target);
-  setOptedOut(false);
+  if (installedPath(target, targetDir)) setTaskMarker(gRunAsAdmin ? target : NULL, gRunAtStartup);
+  setInstallDeclined(false);
   return 0;
+}
+
+static int configureViaUac(void) {
+  wchar_t user[300], params[400], target[MAX_PATH], targetDir[MAX_PATH];
+  userParam(user, 300);
+  _snwprintf(params, 400, L"--configure %ls", user);
+  int code = isElevated() ? configureTask(NULL) : runElevated(params);
+  if (code == 0 && installedPath(target, targetDir)) setTaskMarker(gRunAsAdmin ? target : NULL, gRunAtStartup);
+  return code;
 }
 
 // Shown by the installed copy right after installing, since nothing else is visible.
@@ -1493,22 +1544,81 @@ static bool justInstalled(void) {
 
 static bool startTask(void) { return runHidden(L"/run /tn " TASK_NAME) == 0; }
 
-static void toggleAutostart(void) {
-  if (gAutostart) {
-    if (runElevated(L"--uninstall") == 0) {
-      setMarker(NULL);
-      setOptedOut(true);
-      gAutostart = false;
+// Starts exe without admin rights, even from an elevated process: Explorer (which runs as
+// the user) starts it on our behalf.
+static void launchAsUser(const wchar_t *exe) {
+  if (!isElevated()) { ShellExecuteW(NULL, L"open", exe, NULL, NULL, SW_SHOWNORMAL); return; }
+  wchar_t args[MAX_PATH + 4];
+  _snwprintf(args, MAX_PATH + 4, L"\"%ls\"", exe);
+  ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+}
+
+// Starts the installed copy the way settings.json says: through the task (admin rights,
+// no prompt) or as the user.
+static bool launchInstalled(void) {
+  wchar_t target[MAX_PATH], targetDir[MAX_PATH];
+  if (gRunAsAdmin && startTask()) return true;
+  if (!installedPath(target, targetDir)) return false;
+  launchAsUser(target);
+  return true;
+}
+
+// Hands over to another instance of Macify: this one quits once it has been started.
+static void switchInstance(bool toTask, const wchar_t *exe) {
+  if (gCurveDirty) curveSave();
+  if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }  // let the new instance start
+  if (toTask) { if (!startTask()) return; }
+  else launchAsUser(exe);
+  quit();
+}
+
+// Makes Windows match runAtStartup / runAsAdministrator, then makes sure this instance
+// runs the way they say (switching to an admin or a non-admin instance if needed).
+static void applyStartup(void) {
+  wchar_t exe[MAX_PATH], dir[MAX_PATH], target[MAX_PATH], targetDir[MAX_PATH];
+  if (!exePath(exe, dir) || !installedPath(target, targetDir)) return;
+  bool installed = _wcsicmp(exe, target) == 0;
+  LOG("startup settings: at startup %d, as admin %d (running %s, from %ls)\n", gRunAtStartup, gRunAsAdmin,
+      isElevated() ? "as admin" : "without admin", exe);
+
+  if (gRunAsAdmin) {
+    setRunEntry(NULL);
+    if (!installed || !taskMarkerMatches(target, gRunAtStartup) || !taskExists()) {
+      int code = installed ? configureViaUac() : installViaUac();  // admin copies live in Program Files
+      if (code == -1) {  // UAC prompt declined
+        gRunAsAdmin = false;
+        settingsWrite();
+        setRunEntry(gRunAtStartup ? exe : NULL);
+        trayNotify(L"Run as administrator is off",
+                   L"The admin prompt was declined, so Macify runs without admin rights. Turn it back on in the tray menu.");
+        return;
+      }
+      if (code != 0) {
+        trayNotify(L"Macify setup failed", L"The admin startup task couldn't be set up.");
+        return;
+      }
     }
-    return;
+    if (!isElevated() || !installed) switchInstance(true, NULL);
+  } else {
+    setRunEntry(gRunAtStartup ? exe : NULL);
+    if (taskExists()) {
+      int code = configureViaUac();  // removes the task
+      if (code != 0 && taskExists()) {
+        gRunAsAdmin = true;
+        settingsWrite();
+        trayNotify(L"Run as administrator is still on", L"The admin task couldn't be removed without admin rights.");
+        return;
+      }
+    }
+    setTaskMarker(NULL, false);
+    if (isElevated()) switchInstance(false, exe);
   }
-  if (installViaUac() != 0) return;
-  gAutostart = true;
-  if (!isElevated() || !isInstalledCopy()) {  // switch over to the installed admin copy
-    if (gCurveDirty) curveSave();
-    if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }
-    if (startTask()) quit();
-  }
+}
+
+static void toggleSetting(bool *value) {
+  *value = !*value;
+  settingsWrite();
+  applyStartup();
 }
 
 // ---------------------------------------------------------------- debug log
@@ -1578,8 +1688,8 @@ static void logState(void) {
   logRegString("Windows", L"ProductName");
   logRegString("Windows version", L"DisplayVersion");
   logRegString("Windows build", L"CurrentBuild");
-  LOG("admin rights: %s, installed copy: %s, start with Windows: %s\n", isElevated() ? "yes" : "no",
-      isInstalledCopy() ? "yes" : "no", gAutostart ? "on" : "off");
+  LOG("admin rights: %s, installed copy: %s, run at startup: %s\n", isElevated() ? "yes" : "no",
+      isInstalledCopy() ? "yes" : "no", gRunAtStartup ? "on" : "off");
   LOG("pointer settings: touchpad cursor speed %d, mouse speed %d, enhance precision %d\n",
       gSettingsSig[0], gSettingsSig[1], gSettingsSig[2]);
   HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
@@ -1600,7 +1710,8 @@ static void logState(void) {
   for (int b = 0; b < LEARN_BINS; b++)
     if (gBinMm[b] > 0)
       LOG("  %6.1f mm/s: %6.2f px/mm from %.0f mm of movement\n", binSpeed(b), gBinPx[b] / gBinMm[b], gBinMm[b]);
-  LOG("settings: threeFingerDragAsOneFinger %s, threeFingerDragSpeed %.2f\n", gAsOneFinger ? "true" : "false", gSpeedMul);
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragAsOneFinger %d, threeFingerDragSpeed %.2f\n",
+      gRunAtStartup, gRunAsAdmin, gAsOneFinger, gSpeedMul);
   LOG("--- events ---\n");
 }
 
@@ -1652,13 +1763,20 @@ static void debugFinish(void) {
 
 // ---------------------------------------------------------------- settings file
 
-static const char kDefaultSettings[] =
-  "{\n"
-  "  \"threeFingerDragAsOneFinger\": false,\n"
-  "  \"threeFingerDragSpeed\": 1.0\n"
-  "}\n";
+#define FOUND_STARTUP 1
+#define FOUND_ADMIN   2
+#define FOUND_ASONE   4
+#define FOUND_SPEED   8
+#define FOUND_ALL     15
+
+typedef struct {
+  bool runAtStartup, runAsAdmin, asOneFinger;
+  double speed;
+  int found;  // which settings the file had: FOUND_* bits
+} Settings;
 
 static FILETIME gSettingsTime;
+static wchar_t gSettingsError[256];  // a problem found before the tray icon existed
 static HANDLE gSettingsWatch = INVALID_HANDLE_VALUE;
 
 // A small parser for a flat JSON object of booleans, numbers and strings. Comments
@@ -1699,7 +1817,13 @@ static bool jsonString(Json *j, char *out, size_t n) {
   return true;
 }
 
-static bool parseSettings(const char *text, bool *asOneFinger, double *speed, char *err, size_t errLen) {
+static bool jsonBool(Json *j, bool *out) {
+  if (strncmp(j->p, "true", 4) == 0) { *out = true; j->p += 4; return true; }
+  if (strncmp(j->p, "false", 5) == 0) { *out = false; j->p += 5; return true; }
+  return false;
+}
+
+static bool parseSettings(const char *text, Settings *st, char *err, size_t errLen) {
   Json j = { text, text };
   jsonSkip(&j);
   if (*j.p != '{') { snprintf(err, errLen, "expected { at line %d", jsonLine(&j)); return false; }
@@ -1714,10 +1838,14 @@ static bool parseSettings(const char *text, bool *asOneFinger, double *speed, ch
     j.p++;
     jsonSkip(&j);
     int line = jsonLine(&j);
-    if (strcmp(key, "threeFingerDragAsOneFinger") == 0) {
-      if (strncmp(j.p, "true", 4) == 0) { *asOneFinger = true; j.p += 4; }
-      else if (strncmp(j.p, "false", 5) == 0) { *asOneFinger = false; j.p += 5; }
-      else { snprintf(err, errLen, "\"%s\" must be true or false (line %d)", key, line); return false; }
+    int bit = strcmp(key, "runAtStartup") == 0 ? FOUND_STARTUP
+            : strcmp(key, "runAsAdministrator") == 0 ? FOUND_ADMIN
+            : strcmp(key, "threeFingerDragAsOneFinger") == 0 ? FOUND_ASONE : 0;
+    bool *flag = bit == FOUND_STARTUP ? &st->runAtStartup : bit == FOUND_ADMIN ? &st->runAsAdmin
+               : bit == FOUND_ASONE ? &st->asOneFinger : NULL;
+    if (flag) {
+      if (!jsonBool(&j, flag)) { snprintf(err, errLen, "\"%s\" must be true or false (line %d)", key, line); return false; }
+      st->found |= bit;
     } else if (strcmp(key, "threeFingerDragSpeed") == 0) {
       char *end;
       double v = strtod(j.p, &end);
@@ -1725,7 +1853,8 @@ static bool parseSettings(const char *text, bool *asOneFinger, double *speed, ch
         snprintf(err, errLen, "\"%s\" must be a number above 0, like 1.0 or 1.5 (line %d)", key, line);
         return false;
       }
-      *speed = v;
+      st->speed = v;
+      st->found |= FOUND_SPEED;
       j.p = end;
     } else {  // unknown key: skip its value
       char tmp[256];
@@ -1743,17 +1872,34 @@ static bool parseSettings(const char *text, bool *asOneFinger, double *speed, ch
 
 static bool settingsPath(wchar_t *path) { return dataFile(path, L"settings.json"); }
 
+// Writes the current settings to settings.json (used by the tray menu, and to add
+// settings a file from an older version doesn't have yet).
+static void settingsWrite(void) {
+  wchar_t path[MAX_PATH];
+  if (!settingsPath(path)) return;
+  char speed[32];
+  snprintf(speed, sizeof speed, gSpeedMul == floor(gSpeedMul) ? "%.1f" : "%g", gSpeedMul);
+  FILE *f = _wfopen(path, L"wb");
+  if (!f) return;
+  fprintf(f, "{\n"
+             "  \"runAtStartup\": %s,\n"
+             "  \"runAsAdministrator\": %s,\n"
+             "  \"threeFingerDragAsOneFinger\": %s,\n"
+             "  \"threeFingerDragSpeed\": %s\n"
+             "}\n",
+          gRunAtStartup ? "true" : "false", gRunAsAdmin ? "true" : "false", gAsOneFinger ? "true" : "false", speed);
+  fclose(f);
+  WIN32_FILE_ATTRIBUTE_DATA a;  // our own write: not a change to react to
+  if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) gSettingsTime = a.ftLastWriteTime;
+}
+
 // Loads settings.json if it changed since last time (creating it with the defaults if
-// it doesn't exist). userEdit: show a notification about the result.
+// it doesn't exist). userEdit: the user saved it, so apply and confirm the changes.
 static void settingsLoad(bool userEdit) {
   wchar_t path[MAX_PATH];
   if (!settingsPath(path)) return;
   WIN32_FILE_ATTRIBUTE_DATA a;
-  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) {
-    FILE *f = _wfopen(path, L"wb");
-    if (f) { fwrite(kDefaultSettings, 1, sizeof kDefaultSettings - 1, f); fclose(f); }
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) return;
-  }
+  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) { settingsWrite(); return; }
   if (CompareFileTime(&a.ftLastWriteTime, &gSettingsTime) == 0) return;  // unchanged
   gSettingsTime = a.ftLastWriteTime;
 
@@ -1765,26 +1911,33 @@ static void settingsLoad(bool userEdit) {
   text[n] = 0;
   if (n == 0 && userEdit) return;  // editors sometimes truncate before writing: wait for the real save
 
-  bool asOneFinger = false;
-  double speed = 1.0;
+  Settings st = { true, true, true, 1.0, 0 };  // defaults for anything the file leaves out
   char err[160];
-  if (!parseSettings(text, &asOneFinger, &speed, err, sizeof err)) {
+  if (!parseSettings(text, &st, err, sizeof err)) {
     LOG("settings.json not applied: %s\n", err);
-    wchar_t msg[256];
-    _snwprintf(msg, 256, L"settings.json has a mistake: %hs. Keeping the previous settings.", err);
-    trayNotify(L"Macify settings not applied", msg);
+    _snwprintf(gSettingsError, 256, L"settings.json has a mistake: %hs. Keeping the previous settings.", err);
+    if (gWnd) { trayNotify(L"Macify settings not applied", gSettingsError); gSettingsError[0] = 0; }
     return;
   }
-  bool changed = asOneFinger != gAsOneFinger || speed != gSpeedMul;
-  gAsOneFinger = asOneFinger;
-  gSpeedMul = speed;
-  LOG("settings: threeFingerDragAsOneFinger %s, threeFingerDragSpeed %.2f\n", gAsOneFinger ? "true" : "false", gSpeedMul);
-  if (userEdit && changed) {
+  // Until 1.5, threeFingerDragAsOneFinger meant the opposite (true: follow the finger that
+  // moves most). Those files don't have the startup settings yet: keep their behaviour.
+  if ((st.found & FOUND_ASONE) && !(st.found & (FOUND_STARTUP | FOUND_ADMIN))) st.asOneFinger = !st.asOneFinger;
+  bool dragChanged = st.asOneFinger != gAsOneFinger || st.speed != gSpeedMul;
+  bool startupChanged = st.runAtStartup != gRunAtStartup || st.runAsAdmin != gRunAsAdmin;
+  gRunAtStartup = st.runAtStartup;
+  gRunAsAdmin = st.runAsAdmin;
+  gAsOneFinger = st.asOneFinger;
+  gSpeedMul = st.speed;
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragAsOneFinger %d, threeFingerDragSpeed %.2f\n",
+      gRunAtStartup, gRunAsAdmin, gAsOneFinger, gSpeedMul);
+  if (st.found != FOUND_ALL) settingsWrite();  // from an older version: add the missing settings
+  if (userEdit && dragChanged) {
     wchar_t msg[160];
     _snwprintf(msg, 160, L"Three-finger drag follows %ls, speed %.2fx.",
-               gAsOneFinger ? L"the finger that moves most" : L"the centre of the fingers", gSpeedMul);
+               gAsOneFinger ? L"the centre of the fingers" : L"the finger that moves most", gSpeedMul);
     trayNotify(L"Macify settings applied", msg);
   }
+  if (userEdit && startupChanged && gWnd) applyStartup();
 }
 
 // Watches %APPDATA%\Macify so saved changes apply right away.
@@ -2024,19 +2177,16 @@ static bool takeFlag(const wchar_t *name) {
 static int applyUpdate(DWORD oldPid) {
   HANDLE old = oldPid ? OpenProcess(SYNCHRONIZE, FALSE, oldPid) : NULL;
   if (old) { WaitForSingleObject(old, 15000); CloseHandle(old); }
-  int code = installTask(NULL, 0);
+  int code = installTask(NULL, 0);  // also reads settings.json
   if (code == 0) {
     wchar_t target[MAX_PATH], targetDir[MAX_PATH];
-    if (installedPath(target, targetDir)) setMarker(target);
-    setOptedOut(false);
+    if (installedPath(target, targetDir)) setTaskMarker(gRunAsAdmin ? target : NULL, gRunAtStartup);
+    setInstallDeclined(false);
     flagFile(L"just-updated", true);
   } else {
     flagFile(L"update-failed", true);
   }
-  if (!startTask()) {  // no startup task: start the installed copy directly
-    wchar_t target[MAX_PATH], targetDir[MAX_PATH];
-    if (installedPath(target, targetDir)) ShellExecuteW(NULL, L"open", target, NULL, targetDir, SW_SHOWNORMAL);
-  }
+  launchInstalled();
   return code;
 }
 
@@ -2116,7 +2266,7 @@ static int run(void) {
   LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (argv && argc >= 2 && wcscmp(argv[1], L"--install") == 0)
     return installTask(argc >= 3 ? argv[2] : NULL, argc >= 4 ? wcstoul(argv[3], NULL, 10) : 0);
-  if (argv && argc >= 2 && wcscmp(argv[1], L"--uninstall") == 0) return uninstallTask();
+  if (argv && argc >= 2 && wcscmp(argv[1], L"--configure") == 0) return configureTask(argc >= 3 ? argv[2] : NULL);
   if (argv && argc >= 2 && wcscmp(argv[1], L"--update") == 0)
     return applyUpdate(argc >= 3 ? wcstoul(argv[2], NULL, 10) : 0);
 
@@ -2131,17 +2281,22 @@ static int run(void) {
   }
   migrateOldData();
   gQuitMsg = RegisterWindowMessageW(L"MacifyQuit");
+  settingsLoad(false);
+  wchar_t oldMarker[MAX_PATH];  // replaced by task.txt
+  if (dataFile(oldMarker, L"autostart.txt")) DeleteFileW(oldMarker);
+  if (dataFile(oldMarker, L"autostart-off")) DeleteFileW(oldMarker);
 
   // Started from anywhere but Program Files (a download, a fresh build): install or update.
-  // Also when the installed copy finds its startup task missing.
-  if (!isElevated() && !autostartOptedOut() && !(isInstalledCopy() && autostartInstalled())) {
+  if (!isElevated() && !isInstalledCopy() && !installDeclined()) {
     int result = installViaUac();
     if (result == 0) {
       markJustInstalled(true);
-      if (startTask()) return 0;
+      if (launchInstalled()) return 0;
       markJustInstalled(false);
-    } else if (result == -1) {
-      setOptedOut(true);  // UAC declined: run from here without installing, and don't ask again
+    } else if (result == -1) {  // UAC declined: run from here, without admin rights, and don't ask again
+      setInstallDeclined(true);
+      gRunAsAdmin = false;
+      settingsWrite();
     } else {
       MessageBoxW(NULL, L"Macify couldn't be installed in Program Files.\n\n"
                         L"If it is running, quit it from its tray icon, then run this again.",
@@ -2158,11 +2313,12 @@ static int run(void) {
     return 0;
   }
 
-  gAutostart = autostartInstalled();
-  if (!isElevated() && gAutostart && isInstalledCopy()) {  // e.g. started from the Start menu
-    if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }    // let the admin instance take over
+  // Started without admin rights (e.g. from the Start menu) while it should have them:
+  // the task starts the admin instance, without a prompt.
+  if (!isElevated() && gRunAsAdmin && isInstalledCopy() && taskExists()) {
+    if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }
     if (startTask()) return 0;
-    // couldn't start the task: carry on without admin rights
+    // couldn't start the task: carry on, applyStartup below sorts it out
   }
   ensureStartMenuShortcut();
 
@@ -2206,6 +2362,8 @@ static int run(void) {
   gIcon = makeIcon();
   trayAdd();
   cleanUpdateDownloads();
+  if (gSettingsError[0]) { trayNotify(L"Macify settings not applied", gSettingsError); gSettingsError[0] = 0; }
+  applyStartup();
   if (takeFlag(L"just-updated")) {
     wchar_t msg[96];
     _snwprintf(msg, 96, L"You're now running Macify %hs.", MACIFY_VERSION_STR);

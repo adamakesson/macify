@@ -62,31 +62,36 @@ held, the way AutoHotkey hotkeys do.
 1. In **Settings → Bluetooth & devices → Touchpad**, set three-finger swipes and taps to
    **Nothing**, and turn off **Tap twice and drag to multi-select**.
 2. Run `macify.exe` from wherever you downloaded it and accept the UAC prompt. Macify
-   copies itself to `C:\Program Files\Macify` (it runs with admin rights at login, so it
-   lives where only admins can replace it), registers a scheduled task (`Macify`) that
-   starts it with admin rights at every login without further prompts, adds a **Macify**
-   Start menu shortcut, and starts. A notification confirms it's running.
+   copies itself to `C:\Program Files\Macify` (where only admins can replace it, which
+   matters since it can run with admin rights), sets itself up to start at login with admin
+   rights (see [Settings](#settings)), adds a **Macify** Start menu shortcut, and starts.
+   A notification confirms it's running.
 
 If you decline the UAC prompt, Macify runs from where it is, without admin rights, and
-doesn't ask again; tray icon → **Start with Windows as administrator** installs it later.
+doesn't ask again; tray icon → **Run as administrator** installs it later.
 
 Built for Windows 10/11 with a Precision Touchpad.
 
 ## Settings
 
 Tray icon → **Edit settings** opens `%APPDATA%\Macify\settings.json`. Changes apply as
-soon as you save; a notification confirms them, or says what's wrong with the file.
+soon as you save; a notification confirms them, or says what's wrong with the file. The
+startup options can also be switched from the tray menu, which updates the file.
 
 ```json
 {
-  "threeFingerDragAsOneFinger": false,
+  "runAtStartup": true,
+  "runAsAdministrator": true,
+  "threeFingerDragAsOneFinger": true,
   "threeFingerDragSpeed": 1.0
 }
 ```
 
 | Setting | Meaning |
 |---|---|
-| `threeFingerDragAsOneFinger` | `false` (default): the cursor follows the centre of the fingers, like macOS. `true`: it follows whichever finger moves most, like ThreeFingerDragOnWindows |
+| `runAtStartup` | Start Macify when you log in |
+| `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
+| `threeFingerDragAsOneFinger` | `true` (default): the fingers move the cursor together, as one (their centre), like macOS. `false`: the cursor follows whichever finger moves most, like ThreeFingerDragOnWindows |
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
 
 ## Debug log
@@ -113,7 +118,7 @@ release as release notes. Installed copies pick it up with **Check for updates**
 
 ## Uninstall
 
-1. Tray icon → untick **Start with Windows as administrator**, then **Quit**.
+1. Tray icon → untick **Run at startup** and **Run as administrator**, then **Quit**.
 2. Delete `C:\Program Files\Macify`, `%APPDATA%\Macify` and the Start menu shortcut
    (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Macify.lnk`).
 
