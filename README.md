@@ -34,8 +34,9 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
 - **No jumps**: movement is ignored for a moment while fingers land or lift (many touchpads
   briefly report fingers side by side as one), fingers are paired by position rather than
   by contact ID, and an impossibly sudden jump is held back until it is clear whether it is
-  real (some touchpads briefly report several times the real movement when a sideways drag
-  starts fast). None of this limits how fast you can drag.
+  real (some touchpads briefly report several times the real movement when a drag starts
+  fast; see `threeFingerDragJumpThreshold` in [Settings](#settings)). None of this limits
+  how fast you can drag.
 
 **Credit:** Macify's three-finger drag is inspired by
 [ThreeFingerDragOnWindows](https://github.com/ClementGre/ThreeFingerDragOnWindows) by
@@ -125,6 +126,7 @@ runAtStartup: true
 runAsAdministrator: true
 checkForUpdatesOnStart: true
 threeFingerDragSpeed: 1.0
+threeFingerDragJumpThreshold: 3
 keyRemaps:
   Ctrl+D: Delete
   # ... the other key remaps
@@ -139,6 +141,7 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
 | `checkForUpdatesOnStart` | Shortly after Macify starts, check here for a newer version. If there is one, it's downloaded in the background and a notification offers it: click it, or choose **Install Macify …** in the tray menu. Silent when there's nothing new |
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
+| `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` turns it off, for touchpads that don't do this |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
 
 ## Debug mode

@@ -23,9 +23,12 @@
 //     report fingers side by side as one blob and then split it, which would otherwise
 //     look like a huge, instant movement.
 //   - Some touchpads briefly report several times the real movement for all fingers
-//     (seen when three fingers start moving sideways). A real hand can't change speed
-//     that abruptly, so such a jump is held back for up to SPIKE_HOLD_MS: if it snaps
-//     back it was an artefact and is discarded; if it persists it is applied in full.
+//     (seen when three fingers start moving sideways, often right as they land). A real
+//     hand can't change speed that abruptly, so a change of more than
+//     threeFingerDragJumpThreshold mm between two reports (settings.yaml; 0 = off) is
+//     held back for up to SPIKE_HOLD_MS: if it snaps back it was an artefact and is
+//     discarded; if it persists it is applied in full. Fingers that just landed are
+//     taken to be at rest, so a glitch in the very first reports is caught too.
 //   - Movement is timed with the touchpad's own scan timestamps, not message arrival.
 //   - The cursor position is kept as a float and never re-read mid-drag, so there is
 //     no race with Windows' own input queue.
@@ -95,7 +98,6 @@
 #define ACCEL_LOW_MM_PER_S        20.0   // below this speed: MIN_GAIN
 #define ACCEL_HIGH_MM_PER_S       260.0  // above this speed: MAX_GAIN
 #define SETTLE_MS                 30.0   // ignore movement this long after a finger lands or lifts
-#define MAX_ACCEL_MM_PER_MS2      0.04   // speed change no real hand makes within one frame (40 m/s^2)
 #define SPIKE_HOLD_MS             80.0   // how long a sudden jump is held back before it is trusted
 #define USE_PALM_REJECTION        true   // ignore contacts the touchpad marks as not confident
 #define FALLBACK_PAD_WIDTH_MM     105.0  // used only if the touchpad reports no physical size
@@ -227,6 +229,7 @@ static bool gRunAtStartup = true;  // settings.yaml: runAtStartup
 static bool gRunAsAdmin = true;    // settings.yaml: runAsAdministrator
 static bool gCheckUpdates = true;  // settings.yaml: checkForUpdatesOnStart
 static double gSpeedMul = 1.0;     // settings.yaml: threeFingerDragSpeed
+static double gJumpMm = 3.0;       // settings.yaml: threeFingerDragJumpThreshold (0: no filter)
 static int gLastScan = -1;
 static bool gVelValid, gHolding;
 static double gVx, gVy;  // trusted finger velocity, mm/ms
@@ -652,34 +655,36 @@ static bool sameFingers(const Contact *a, int na, const Contact *b, int nb) {
 
 static void resetMotionFilter(void) { gVelValid = gHolding = false; }
 
-// Holds back physically impossible jumps; see the notes at the top of the file.
+// Holds back physically impossible jumps; see the notes at the top of the file. Works in
+// mm per touchpad report: how far this report's movement is from what the trusted speed
+// predicts.
 static void filterMotion(double *dx, double *dy, double dtMs) {
-  double vx = *dx / dtMs, vy = *dy / dtMs;
-  if (!gVelValid) { gVx = vx; gVy = vy; gVelValid = true; return; }
-  double dev = hypot(vx - gVx, vy - gVy);
+  if (gJumpMm <= 0) return;  // turned off in settings.yaml
+  if (!gVelValid) { gVx = gVy = 0; gVelValid = true; }  // fingers that just landed are at rest
+  double ex = gVx * dtMs, ey = gVy * dtMs;              // movement the trusted speed predicts
+  double jump = hypot(*dx - ex, *dy - ey);
   if (!gHolding) {
-    if (dev <= MAX_ACCEL_MM_PER_MS2 * dtMs) { gVx = vx; gVy = vy; return; }
+    if (jump <= gJumpMm) { gVx = *dx / dtMs; gVy = *dy / dtMs; return; }
     gHolding = true;
     gHoldMs = 0;
     gPendX = gPendY = 0;
-    gEntryJump = dev;
-    LOG("sudden jump of %.1f mm/frame, holding back\n", dev * dtMs);
-  } else if (dev < 0.5 * gEntryJump) {
+    gEntryJump = jump;
+    LOG("sudden jump of %.1f mm/frame, holding back\n", jump);
+  } else if (jump < 0.5 * gEntryJump) {
     LOG("jump snapped back after %.0f ms: discarded %.1f mm\n", gHoldMs, hypot(gPendX, gPendY));
     gHolding = false;
-    gVx = vx; gVy = vy;
+    gVx = *dx / dtMs; gVy = *dy / dtMs;
     return;
   }
-  double ex = gVx * dtMs, ey = gVy * dtMs;  // continue at the trusted speed meanwhile
-  gHoldMs += dtMs;
+  gHoldMs += dtMs;  // meanwhile, continue at the trusted speed
   gPendX += *dx - ex;
   gPendY += *dy - ey;
   if (gHoldMs >= SPIKE_HOLD_MS) {
     LOG("jump persisted: catching up %.1f mm\n", hypot(gPendX, gPendY));
+    gVx = *dx / dtMs; gVy = *dy / dtMs;
     *dx = ex + gPendX;
     *dy = ey + gPendY;
     gHolding = false;
-    gVx = vx; gVy = vy;
     return;
   }
   *dx = ex;
@@ -1936,12 +1941,13 @@ static void debugFinish(void) {
 #define FOUND_SPEED   4
 #define FOUND_REMAPS  8
 #define FOUND_UPDATES 16
-#define FOUND_ALL     31
-#define FOUND_OBSOLETE 32  // a setting that no longer exists: rewrite the file without it
+#define FOUND_JUMP    32
+#define FOUND_ALL     63
+#define FOUND_OBSOLETE 64  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
   bool runAtStartup, runAsAdmin, checkUpdates;
-  double speed;
+  double speed, jump;
   Remap remaps[MAX_REMAPS];
   int remapCount;
   char skipped[400];  // key remaps that couldn't be used, and why
@@ -2193,6 +2199,15 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       }
       st->speed = v;
       st->found |= FOUND_SPEED;
+    } else if (!strcmp(key, "threeFingerDragJumpThreshold")) {
+      char *end;
+      double v = strtod(value, &end);
+      if (end == value || *end || !(v >= 0) || v > 100) {
+        snprintf(err, errLen, "threeFingerDragJumpThreshold must be 0 (off) or a number of mm, like 3 (line %d)", lineNo);
+        return false;
+      }
+      st->jump = v;
+      st->found |= FOUND_JUMP;
     } else {
       LOG("settings: ignoring unknown \"%s\"\n", key);
     }
@@ -2212,6 +2227,11 @@ static const char kHelpUpdates[] =
   "# When Macify starts, check GitHub for a newer version and offer to install it: true or false.\n";
 static const char kHelpSpeed[] =
   "# Multiplies the three-finger drag speed. 1.0 matches the normal pointer, 1.5 is 50% faster.\n";
+static const char kHelpJump[] =
+  "# Some touchpads briefly report a much bigger movement than the real one, mostly when a\n"
+  "# drag starts fast, which makes the cursor jump. A sudden change of more than this many mm\n"
+  "# between two touchpad reports is held back until it's clear whether it was real. It never\n"
+  "# limits how fast you can drag. 0 turns this off (for touchpads that don't do this).\n";
 static const char kHelpRemaps[] =
   "# Key remaps, one indented line each:  keys you press: keys sent instead\n"
   "#   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
@@ -2253,10 +2273,12 @@ static void settingsWrite(void) {
   snprintf(speed, sizeof speed, gSpeedMul == floor(gSpeedMul) ? "%.1f" : "%g", gSpeedMul);
   FILE *f = _wfopen(path, L"wb");
   if (!f) return;
+  char jump[32];
+  snprintf(jump, sizeof jump, gJumpMm == floor(gJumpMm) ? "%.0f" : "%g", gJumpMm);
   fprintf(f, "%s\n%srunAtStartup: %s\n\n%srunAsAdministrator: %s\n\n%scheckForUpdatesOnStart: %s\n\n"
-             "%sthreeFingerDragSpeed: %s\n\n%s",
+             "%sthreeFingerDragSpeed: %s\n\n%sthreeFingerDragJumpThreshold: %s\n\n%s",
           kHelpTop, kHelpStartup, gRunAtStartup ? "true" : "false", kHelpAdmin, gRunAsAdmin ? "true" : "false",
-          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpRemaps);
+          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpJump, jump, kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
   fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
@@ -2330,7 +2352,7 @@ static void settingsInsertLine(const char *help, const char *line, const char *b
 // Applies parsed settings. userEdit: the user saved the file, so confirm the changes.
 static void settingsApply(Settings *st, bool userEdit) {
   if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount);
-  bool dragChanged = st->speed != gSpeedMul;
+  bool dragChanged = st->speed != gSpeedMul || st->jump != gJumpMm;
   bool startupChanged = st->runAtStartup != gRunAtStartup || st->runAsAdmin != gRunAsAdmin;
   AcquireSRWLockShared(&gRemapLock);
   bool remapsChanged = st->remapCount != gRemapCount ||
@@ -2340,21 +2362,30 @@ static void settingsApply(Settings *st, bool userEdit) {
   gRunAsAdmin = st->runAsAdmin;
   gCheckUpdates = st->checkUpdates;
   gSpeedMul = st->speed;
+  gJumpMm = st->jump;
   setRemaps(st->remaps, st->remapCount);
-  LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, threeFingerDragSpeed %.2f, %d key remaps\n",
-      gRunAtStartup, gRunAsAdmin, gCheckUpdates, gSpeedMul, gRemapCount);
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, threeFingerDragSpeed %.2f, "
+      "threeFingerDragJumpThreshold %.1f, %d key remaps\n", gRunAtStartup, gRunAsAdmin, gCheckUpdates, gSpeedMul, gJumpMm, gRemapCount);
   if (st->skipped[0]) LOG("settings: skipped %s\n", st->skipped);
   // From an older version: add missing settings (and the explanation), drop removed ones.
-  if ((st->found & ~FOUND_OBSOLETE) == (FOUND_ALL & ~FOUND_UPDATES) && !(st->found & FOUND_OBSOLETE))
-    settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Multiplies the three-finger drag speed");
-  else if (st->found != FOUND_ALL) settingsWrite();
+  // Settings added since: insert just those, keeping the user's file (and comments) as is.
+  int missing = FOUND_ALL & ~st->found;
+  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP))) {
+    if (missing & FOUND_UPDATES)
+      settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Multiplies the three-finger drag speed");
+    if (missing & FOUND_JUMP)
+      settingsInsertLine(kHelpJump, "threeFingerDragJumpThreshold: 3", "# Key remaps");
+  } else if (st->found != FOUND_ALL) {
+    settingsWrite();
+  }
 
   if (st->skipped[0]) {
     _snwprintf(gSettingsError, 256, L"Skipped %hs. The other settings are applied.", st->skipped);
     if (gWnd) { trayNotify(L"Some key remaps were skipped", gSettingsError); gSettingsError[0] = 0; }
   } else if (userEdit && (dragChanged || remapsChanged)) {
     wchar_t msg[160];
-    _snwprintf(msg, 160, L"%d key remaps active. Three-finger drag speed: %.2fx.", gRemapCount, gSpeedMul);
+    _snwprintf(msg, 160, L"%d key remaps active. Drag speed %.2fx, jump threshold %g mm%ls.", gRemapCount, gSpeedMul,
+               gJumpMm, gJumpMm <= 0 ? L" (off)" : L"");
     trayNotify(L"Macify settings applied", msg);
   }
   if (userEdit && startupChanged && gWnd) applyStartup();
@@ -2364,6 +2395,7 @@ static void settingsDefaults(Settings *st) {
   memset(st, 0, sizeof *st);
   st->runAtStartup = st->runAsAdmin = st->checkUpdates = true;  // for anything the file leaves out
   st->speed = 1.0;
+  st->jump = 3.0;
 }
 
 static size_t readSmallFile(const wchar_t *path, char *text, size_t size) {
