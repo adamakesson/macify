@@ -13,8 +13,7 @@
 
 **Credit:** Macify's three-finger drag is inspired by
 [ThreeFingerDragOnWindows](https://github.com/ClementGre/ThreeFingerDragOnWindows) by
-Clément Grennerat, which I used before writing this. Its approach of moving the cursor by
-whichever finger moves most is the one Macify uses. Macify is a separate implementation
+Clément Grennerat, which I used before writing this. Macify is a separate implementation
 and contains none of its code.
 
 Small Windows background app that makes a Windows laptop behave more like a Mac:
