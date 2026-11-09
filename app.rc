@@ -1,12 +1,13 @@
 #include <winver.h>
+#include "version.h"
 
 1 ICON "app.ico"
 2 ICON "tray-dark.ico"
 3 ICON "tray-light.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,1,0,0
-PRODUCTVERSION 1,1,0,0
+FILEVERSION MACIFY_VERSION_NUM
+PRODUCTVERSION MACIFY_VERSION_NUM
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -16,8 +17,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Macify"
       VALUE "ProductName", "Macify"
-      VALUE "FileVersion", "1.1"
-      VALUE "ProductVersion", "1.1"
+      VALUE "FileVersion", MACIFY_VERSION_STR
+      VALUE "ProductVersion", MACIFY_VERSION_STR
       VALUE "OriginalFilename", "macify.exe"
     END
   END

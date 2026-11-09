@@ -71,6 +71,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "version.h"
 
 // ---------------------------------------------------------------- preferences
 
@@ -507,6 +508,14 @@ static void moveCursor(double dxMm, double dyMm, double dtMs) {
 
   LONG ix = (LONG)lround(gCurX), iy = (LONG)lround(gCurY);
   if (ix == gSentX && iy == gSentY) return;
+#ifdef TFD_DEBUG
+  POINT actual;  // where Windows has the cursor vs. where we last put it
+  GetCursorPos(&actual);
+  if (labs(actual.x - gSentX) + labs(actual.y - gSentY) > 2)
+    LOG("  cursor is %ld,%ld px behind where we put it\n", gSentX - actual.x, gSentY - actual.y);
+  LARGE_INTEGER t0, t1;
+  QueryPerformanceCounter(&t0);
+#endif
 
   int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
   int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -517,6 +526,11 @@ static void moveCursor(double dxMm, double dyMm, double dtMs) {
   in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
   in.mi.dwExtraInfo = INPUT_MAGIC;
   SendInput(1, &in, sizeof in);
+#ifdef TFD_DEBUG
+  QueryPerformanceCounter(&t1);
+  double sendMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)gFreq.QuadPart;
+  if (sendMs > 2) LOG("  moving the cursor took %.1f ms\n", sendMs);
+#endif
   gSentX = ix; gSentY = iy;
 }
 
@@ -704,7 +718,7 @@ static void processFrame(const Contact *all, int n, int scanTime) {
     (void)rx; (void)ry;  // only used by the debug log
     filterMotion(&dx, &dy, dtMs);
     if (gState == DRAGGING && !gReleasePending)
-      LOG("move %6.2f,%6.2f mm in %4.1f ms (raw %6.2f,%6.2f)\n", dx, dy, dtMs, rx, ry);
+      LOG("move %6.2f,%6.2f mm in %4.1f ms (raw %6.2f,%6.2f) gain %.1f px/mm\n", dx, dy, dtMs, rx, ry, gainAt(gDragSpeed));
   } else {
     resetMotionFilter();
   }
@@ -1126,7 +1140,9 @@ static void showTrayMenu(void) {
   int learned = learnedBins();
   if (learned == 0) _snwprintf(status, 96, L"Pointer speed: learning, move one finger normally");
   else _snwprintf(status, 96, L"Pointer speed: %d of %d speed ranges learned", learned, LEARN_BINS);
-  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Macify");
+  wchar_t title[48];
+  _snwprintf(title, 48, L"Macify %hs", MACIFY_VERSION_STR);
+  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, title);
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
@@ -1550,7 +1566,7 @@ static int run(void) {
   gMutex = mutex;
   DWORD err = GetLastError();
   // ACCESS_DENIED: an elevated instance already holds it.
-  LOG("Macify debug build starting\n");
+  LOG("Macify %s debug build starting\n", MACIFY_VERSION_STR);
   if ((mutex && err == ERROR_ALREADY_EXISTS) || (!mutex && err == ERROR_ACCESS_DENIED)) {
     LOG("Another copy is already running%s. Quit it from its tray icon (or run\n"
         "'taskkill /f /im macify.exe' in an admin terminal), then start this again.\n",
