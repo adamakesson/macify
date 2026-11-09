@@ -9,9 +9,10 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
 - **Ctrl+click and Alt+click** give a plain right-click, and a three-finger drag started
   with Ctrl or Alt held is a right-button drag.
 
-No settings window: all preferences are constants at the top of [`macify.c`](macify.c).
-A tray icon has a menu to quit, relearn the pointer speed and turn start-with-Windows on
-or off.
+No settings window: a few settings live in a small file (see [Settings](#settings)), the
+rest are constants at the top of [`macify.c`](macify.c). A tray icon has a menu to edit
+the settings, relearn the pointer speed, turn start-with-Windows on or off, record a debug
+log and quit.
 
 ## Three-finger drag
 
@@ -59,6 +60,23 @@ If you decline the UAC prompt, Macify runs from where it is, without admin right
 doesn't ask again; tray icon → **Start with Windows as administrator** installs it later.
 
 Built for Windows 10/11 with a Precision Touchpad.
+
+## Settings
+
+Tray icon → **Edit settings** opens `%APPDATA%\Macify\settings.json`. Changes apply as
+soon as you save; a notification confirms them, or says what's wrong with the file.
+
+```json
+{
+  "threeFingerDragAsOneFinger": false,
+  "threeFingerDragSpeed": 1.0
+}
+```
+
+| Setting | Meaning |
+|---|---|
+| `threeFingerDragAsOneFinger` | `false` (default): the cursor follows the centre of the fingers, like macOS. `true`: it follows whichever finger moves most, like ThreeFingerDragOnWindows |
+| `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
 
 ## Debug log
 

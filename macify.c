@@ -43,6 +43,13 @@
 // Earlier versions were called three-finger-drag: their settings, startup task and
 // Start menu shortcut are taken over automatically.
 //
+// Settings file: %APPDATA%\Macify\settings.json (tray menu > Edit settings), created
+// with the defaults, picked up as soon as it is saved:
+//   "threeFingerDragAsOneFinger": false  true: the cursor follows whichever finger moves
+//                                        the most, like ThreeFingerDragOnWindows; false:
+//                                        it follows the centre of the fingers (macOS)
+//   "threeFingerDragSpeed": 1.0          multiplies the three-finger drag speed
+//
 // Pointer speed is learned, not configured: while you use one finger normally, the app
 // compares how far (and how fast) your finger moved with how far Windows moved the
 // cursor, and builds Windows' speed curve from that. The drag then uses that curve, so
@@ -113,6 +120,7 @@
 #define WM_TRAY (WM_APP + 1)
 #define WM_CANCEL_DRAG (WM_APP + 2)
 #define TIMER_SAVE 3
+#define TIMER_SETTINGS 4
 #define TASK_NAME L"Macify"
 #define OLD_NAME L"three-finger-drag"  // previous name: data folder, task, mutex
 #define ID_QUIT 100
@@ -121,6 +129,7 @@
 #define ID_RELEARN 101
 #define ID_AUTOSTART 102
 #define ID_DEBUG 103
+#define ID_SETTINGS 104
 
 // speed-curve learning
 #define LEARN_BINS          16
@@ -139,6 +148,7 @@ static void debugLog(const char *fmt, ...);
 #define LOG(...) do { if (gDebugOn) debugLog(__VA_ARGS__); } while (0)
 static void debugStart(void);
 static void debugFinish(void);
+static void settingsEdit(void);
 
 typedef struct {
   ULONG id;
@@ -197,6 +207,8 @@ static bool gCurveDirty;
 static int gSettingsSig[3];
 static double gDragSpeed;
 static double gSettleUntilMs;
+static bool gAsOneFinger = false;  // settings.json: threeFingerDragAsOneFinger
+static double gSpeedMul = 1.0;     // settings.json: threeFingerDragSpeed
 static int gLastScan = -1;
 static bool gVelValid, gHolding;
 static double gVx, gVy;  // trusted finger velocity, mm/ms
@@ -502,7 +514,7 @@ static void moveCursor(double dxMm, double dyMm, double dtMs) {
   double inst = dist / (dtMs / 1000.0);
   gDragSpeed += (inst - gDragSpeed) * (1.0 - exp(-dtMs / SPEED_SMOOTH_MS));
   if (dist <= 0) return;
-  double gain = gainAt(gDragSpeed);
+  double gain = gainAt(gDragSpeed) * gSpeedMul;
 
   gCurX += dxMm * gain;
   gCurY += dyMm * gain;
@@ -687,7 +699,8 @@ static void processFrame(const Contact *all, int n, int scanTime) {
   }
   bool settling = nowMs < gSettleUntilMs;
 
-  // Movement of the group's centre: average of each finger's movement.
+  // Movement of the group's centre: average of each finger's movement. Or, with
+  // threeFingerDragAsOneFinger, the movement of the finger that moved most.
   double dx = 0, dy = 0;
   int used = 0;
   if (!settling && count > 0 && count == gPrevCount) {
@@ -698,13 +711,19 @@ static void processFrame(const Contact *all, int n, int scanTime) {
       fx[i] = sx[i] = active[i].x - gPrev[perm[i]].x;
       fy[i] = sy[i] = active[i].y - gPrev[perm[i]].y;
     }
+    if (gAsOneFinger) {
+      double best = -1;
+      for (int i = 0; i < count; i++)
+        if (hypot(fx[i], fy[i]) > best) { best = hypot(fx[i], fy[i]); dx = fx[i]; dy = fy[i]; }
+      used = count;
+    }
     double mx = 0, my = 0, limit = INFINITY;
-    if (count >= 3) {  // with three or more fingers the median tells us what the hand did
+    if (!gAsOneFinger && count >= 3) {  // with three or more fingers the median tells us what the hand did
       mx = median(sx, count);
       my = median(sy, count);
       limit = OUTLIER_MM + 0.5 * hypot(mx, my);
     }
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count && !gAsOneFinger; i++) {
       if (hypot(fx[i] - mx, fy[i] - my) > limit) {
         LOG("ignored finger moving %.1fmm against the others\n", hypot(fx[i] - mx, fy[i] - my));
         continue;
@@ -713,7 +732,7 @@ static void processFrame(const Contact *all, int n, int scanTime) {
       dy += fy[i];
       used++;
     }
-    if (used) { dx /= used; dy /= used; }
+    if (used && !gAsOneFinger) { dx /= used; dy /= used; }
   }
   if (used && count == DRAG_FINGERS && (gState == ARMED || gState == DRAGGING)) {
     double rx = dx, ry = dy;
@@ -1159,6 +1178,7 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
   AppendMenuW(menu, MF_STRING | (gAutostart ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows as administrator");
+  AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug log (save to desktop)" : L"Start debug log");
   AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit");
@@ -1168,6 +1188,7 @@ static void showTrayMenu(void) {
   DestroyMenu(menu);
   if (cmd == ID_RELEARN) { curveClear(); curveSave(); }
   if (cmd == ID_AUTOSTART) toggleAutostart();
+  if (cmd == ID_SETTINGS) settingsEdit();
   if (cmd == ID_DEBUG) { if (gDebugOn) debugFinish(); else debugStart(); }
   if (cmd == ID_QUIT) quit();
 }
@@ -1570,6 +1591,7 @@ static void logState(void) {
   for (int b = 0; b < LEARN_BINS; b++)
     if (gBinMm[b] > 0)
       LOG("  %6.1f mm/s: %6.2f px/mm from %.0f mm of movement\n", binSpeed(b), gBinPx[b] / gBinMm[b], gBinMm[b]);
+  LOG("settings: threeFingerDragAsOneFinger %s, threeFingerDragSpeed %.2f\n", gAsOneFinger ? "true" : "false", gSpeedMul);
   LOG("--- events ---\n");
 }
 
@@ -1619,6 +1641,162 @@ static void debugFinish(void) {
   trayNotify(saved ? L"Macify debug log saved" : L"Macify debug log not saved", text);
 }
 
+// ---------------------------------------------------------------- settings file
+
+static const char kDefaultSettings[] =
+  "{\n"
+  "  \"threeFingerDragAsOneFinger\": false,\n"
+  "  \"threeFingerDragSpeed\": 1.0\n"
+  "}\n";
+
+static FILETIME gSettingsTime;
+static HANDLE gSettingsWatch = INVALID_HANDLE_VALUE;
+
+// A small parser for a flat JSON object of booleans, numbers and strings. Comments
+// (// and /* */) are allowed; unknown keys are ignored. On a syntax error, *err says
+// where and false is returned.
+typedef struct { const char *p, *start; } Json;
+
+static void jsonSkip(Json *j) {
+  for (;;) {
+    while (*j->p == ' ' || *j->p == '\t' || *j->p == '\r' || *j->p == '\n') j->p++;
+    if (j->p[0] == '/' && j->p[1] == '/') { while (*j->p && *j->p != '\n') j->p++; continue; }
+    if (j->p[0] == '/' && j->p[1] == '*') {
+      const char *e = strstr(j->p + 2, "*/");
+      j->p = e ? e + 2 : j->p + strlen(j->p);
+      continue;
+    }
+    if ((unsigned char)j->p[0] == 0xEF && (unsigned char)j->p[1] == 0xBB && (unsigned char)j->p[2] == 0xBF) { j->p += 3; continue; }
+    return;
+  }
+}
+
+static int jsonLine(const Json *j) {
+  int line = 1;
+  for (const char *c = j->start; c < j->p; c++) if (*c == '\n') line++;
+  return line;
+}
+
+static bool jsonString(Json *j, char *out, size_t n) {
+  if (*j->p != '"') return false;
+  size_t o = 0;
+  for (j->p++; *j->p && *j->p != '"'; j->p++) {
+    if (*j->p == '\\' && j->p[1]) j->p++;
+    if (o + 1 < n) out[o++] = *j->p;
+  }
+  if (*j->p != '"') return false;
+  j->p++;
+  out[o] = 0;
+  return true;
+}
+
+static bool parseSettings(const char *text, bool *asOneFinger, double *speed, char *err, size_t errLen) {
+  Json j = { text, text };
+  jsonSkip(&j);
+  if (*j.p != '{') { snprintf(err, errLen, "expected { at line %d", jsonLine(&j)); return false; }
+  j.p++;
+  for (;;) {
+    jsonSkip(&j);
+    if (*j.p == '}') return true;
+    char key[64];
+    if (!jsonString(&j, key, sizeof key)) { snprintf(err, errLen, "expected a \"name\" at line %d", jsonLine(&j)); return false; }
+    jsonSkip(&j);
+    if (*j.p != ':') { snprintf(err, errLen, "expected : after \"%s\" at line %d", key, jsonLine(&j)); return false; }
+    j.p++;
+    jsonSkip(&j);
+    int line = jsonLine(&j);
+    if (strcmp(key, "threeFingerDragAsOneFinger") == 0) {
+      if (strncmp(j.p, "true", 4) == 0) { *asOneFinger = true; j.p += 4; }
+      else if (strncmp(j.p, "false", 5) == 0) { *asOneFinger = false; j.p += 5; }
+      else { snprintf(err, errLen, "\"%s\" must be true or false (line %d)", key, line); return false; }
+    } else if (strcmp(key, "threeFingerDragSpeed") == 0) {
+      char *end;
+      double v = strtod(j.p, &end);
+      if (end == j.p || !(v > 0) || v > 20) {
+        snprintf(err, errLen, "\"%s\" must be a number above 0, like 1.0 or 1.5 (line %d)", key, line);
+        return false;
+      }
+      *speed = v;
+      j.p = end;
+    } else {  // unknown key: skip its value
+      char tmp[256];
+      if (*j.p == '"') { if (!jsonString(&j, tmp, sizeof tmp)) { snprintf(err, errLen, "unfinished text at line %d", line); return false; } }
+      else while (*j.p && *j.p != ',' && *j.p != '}' && *j.p != '\n') j.p++;
+      LOG("settings: ignoring unknown \"%s\"\n", key);
+    }
+    jsonSkip(&j);
+    if (*j.p == ',') { j.p++; continue; }
+    if (*j.p == '}') return true;
+    snprintf(err, errLen, "expected , or } at line %d", jsonLine(&j));
+    return false;
+  }
+}
+
+static bool settingsPath(wchar_t *path) { return dataFile(path, L"settings.json"); }
+
+// Loads settings.json if it changed since last time (creating it with the defaults if
+// it doesn't exist). userEdit: show a notification about the result.
+static void settingsLoad(bool userEdit) {
+  wchar_t path[MAX_PATH];
+  if (!settingsPath(path)) return;
+  WIN32_FILE_ATTRIBUTE_DATA a;
+  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) {
+    FILE *f = _wfopen(path, L"wb");
+    if (f) { fwrite(kDefaultSettings, 1, sizeof kDefaultSettings - 1, f); fclose(f); }
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) return;
+  }
+  if (CompareFileTime(&a.ftLastWriteTime, &gSettingsTime) == 0) return;  // unchanged
+  gSettingsTime = a.ftLastWriteTime;
+
+  FILE *f = _wfopen(path, L"rb");
+  if (!f) return;
+  char text[8192];
+  size_t n = fread(text, 1, sizeof text - 1, f);
+  fclose(f);
+  text[n] = 0;
+  if (n == 0 && userEdit) return;  // editors sometimes truncate before writing: wait for the real save
+
+  bool asOneFinger = false;
+  double speed = 1.0;
+  char err[160];
+  if (!parseSettings(text, &asOneFinger, &speed, err, sizeof err)) {
+    LOG("settings.json not applied: %s\n", err);
+    wchar_t msg[256];
+    _snwprintf(msg, 256, L"settings.json has a mistake: %hs. Keeping the previous settings.", err);
+    trayNotify(L"Macify settings not applied", msg);
+    return;
+  }
+  bool changed = asOneFinger != gAsOneFinger || speed != gSpeedMul;
+  gAsOneFinger = asOneFinger;
+  gSpeedMul = speed;
+  LOG("settings: threeFingerDragAsOneFinger %s, threeFingerDragSpeed %.2f\n", gAsOneFinger ? "true" : "false", gSpeedMul);
+  if (userEdit && changed) {
+    wchar_t msg[160];
+    _snwprintf(msg, 160, L"Three-finger drag follows %ls, speed %.2fx.",
+               gAsOneFinger ? L"the finger that moves most" : L"the centre of the fingers", gSpeedMul);
+    trayNotify(L"Macify settings applied", msg);
+  }
+}
+
+// Watches %APPDATA%\Macify so saved changes apply right away.
+static void settingsWatchStart(void) {
+  wchar_t path[MAX_PATH];
+  if (!settingsPath(path)) return;
+  wchar_t *slash = wcsrchr(path, L'\\');
+  if (slash) *slash = 0;
+  gSettingsWatch = FindFirstChangeNotificationW(path, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
+}
+
+// Opens settings.json in the default editor, without admin rights: Explorer (which runs
+// as the user) opens it on our behalf.
+static void settingsEdit(void) {
+  wchar_t path[MAX_PATH], args[MAX_PATH + 4];
+  if (!settingsPath(path)) return;
+  settingsLoad(false);  // make sure it exists
+  _snwprintf(args, MAX_PATH + 4, L"\"%ls\"", path);
+  ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+}
+
 // ---------------------------------------------------------------- window plumbing
 
 static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1628,8 +1806,14 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
       break;  // DefWindowProc must still see WM_INPUT
     case WM_TIMER:
       if (wp == TIMER_RELEASE) { endDrag(); return 0; }
+      if (wp == TIMER_SETTINGS) { KillTimer(w, TIMER_SETTINGS); settingsLoad(true); return 0; }
       if (wp == TIMER_TRAY_RETRY) { trayAdd(); return 0; }
-      if (wp == TIMER_SAVE) { checkSettings(); if (gCurveDirty) curveSave(); return 0; }
+      if (wp == TIMER_SAVE) {
+        checkSettings();
+        if (gSettingsWatch == INVALID_HANDLE_VALUE) settingsLoad(true);
+        if (gCurveDirty) curveSave();
+        return 0;
+      }
       break;
     case WM_CANCEL_DRAG:
       if (gReleasePending) { LOG("cursor moved during grace period\n"); endDrag(); }
@@ -1752,6 +1936,8 @@ static int run(void) {
   HANDLE remap = CreateThread(NULL, 0, remapThread, NULL, 0, &remapThreadId);
 
   curveLoad();
+  settingsLoad(false);
+  settingsWatchStart();
   SetTimer(gWnd, TIMER_SAVE, SAVE_INTERVAL_MS, NULL);
   gIcon = makeIcon();
   trayAdd();
@@ -1762,10 +1948,21 @@ static int run(void) {
   }
 
   MSG m;
-  while (GetMessageW(&m, NULL, 0, 0) > 0) {
-    TranslateMessage(&m);
-    DispatchMessageW(&m);
+  for (bool running = true; running;) {
+    DWORD handles = gSettingsWatch != INVALID_HANDLE_VALUE ? 1 : 0;
+    DWORD r = MsgWaitForMultipleObjects(handles, &gSettingsWatch, FALSE, INFINITE, QS_ALLINPUT);
+    if (handles && r == WAIT_OBJECT_0) {  // something in %APPDATA%\Macify changed:
+      SetTimer(gWnd, TIMER_SETTINGS, 150, NULL);  // look once the editor has finished writing
+      FindNextChangeNotification(gSettingsWatch);
+      continue;
+    }
+    while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+      if (m.message == WM_QUIT) { running = false; break; }
+      TranslateMessage(&m);
+      DispatchMessageW(&m);
+    }
   }
+  if (gSettingsWatch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(gSettingsWatch);
   endDrag();
   if (gCurveDirty) curveSave();
   if (remap) {
