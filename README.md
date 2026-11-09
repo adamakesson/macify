@@ -11,11 +11,6 @@
 > touchpad input. **Read the code before you run it**, and use it entirely at your own
 > risk.
 
-**Credit:** Macify's three-finger drag is inspired by
-[ThreeFingerDragOnWindows](https://github.com/ClementGre/ThreeFingerDragOnWindows) by
-Clément Grennerat, which I used before writing this. Macify is a separate implementation
-and contains none of its code.
-
 Small Windows background app that makes a Windows laptop behave more like a Mac:
 
 - **Three-finger drag** on Precision Touchpads, like macOS: put three fingers down and move
@@ -46,6 +41,11 @@ log and quit.
   by contact ID, and an impossibly sudden jump is held back until it is clear whether it is
   real (some touchpads briefly report several times the real movement when a sideways drag
   starts fast). None of this limits how fast you can drag.
+
+**Credit:** Macify's three-finger drag is inspired by
+[ThreeFingerDragOnWindows](https://github.com/ClementGre/ThreeFingerDragOnWindows) by
+Clément Grennerat, which I used before writing this. Macify is a separate implementation
+and contains none of its code.
 
 ## Windows key = Ctrl key
 
