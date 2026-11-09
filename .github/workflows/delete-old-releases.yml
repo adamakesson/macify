@@ -1,0 +1,28 @@
+# Run by hand (Actions tab -> "Delete old releases" -> Run workflow): deletes every release
+# except the latest one, together with its git tag. This can't be undone.
+name: Delete old releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all releases except the latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          latest=$(gh release view --repo "$REPO" --json tagName --jq .tagName)
+          echo "Keeping the latest release: $latest"
+          gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName' |
+            while read -r tag; do
+              if [ "$tag" != "$latest" ]; then
+                echo "Deleting release $tag"
+                gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag
+              fi
+            done
