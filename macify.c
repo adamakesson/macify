@@ -153,6 +153,7 @@ static void debugFinish(void);
 static void settingsEdit(void);
 static void settingsLoad(bool userEdit);
 static void settingsWrite(void);
+static void settingsSetBool(const char *name, bool value);
 static void quit(void);
 static void updateCheck(void);
 static volatile bool gUpdateBusy;
@@ -834,6 +835,139 @@ static void onRawInput(HRAWINPUT h) {
     handleReport(d, (PCHAR)(rep + i * ri->data.hid.dwSizeHid), ri->data.hid.dwSizeHid);
 }
 
+// ---------------------------------------------------------------- key remap table
+//
+// Filled from the "keyRemaps" section of settings.json (defaults below), read by the
+// keyboard hook. Written as text like "Ctrl+Shift+7": modifiers, then one key.
+
+#define KM_CTRL  1
+#define KM_ALT   2
+#define KM_SHIFT 4
+#define KM_WIN   8
+#define MAX_REMAPS 64
+
+typedef struct {
+  BYTE mods;
+  UINT vk;      // a fixed key, or 0 when the key is given as a character:
+  wchar_t ch;   // looked up on the current keyboard layout when used
+} KeySpec;
+
+typedef struct {
+  KeySpec from, to;
+  char fromText[48], toText[48];  // as written in the file
+} Remap;
+
+static Remap gRemaps[MAX_REMAPS];
+static int gRemapCount;
+static SRWLOCK gRemapLock = SRWLOCK_INIT;
+
+static const char *const kDefaultRemaps[][2] = {
+  { "Ctrl+D", "Delete" },          { "Ctrl+Backspace", "Delete" },
+  { "Ctrl+2", "Ctrl+Alt+2" },      { "Ctrl+3", "Ctrl+Alt+3" },      { "Ctrl+4", "Ctrl+Alt+4" },
+  { "Ctrl+7", "Ctrl+Alt+7" },      { "Ctrl+8", "Ctrl+Alt+8" },      { "Ctrl+9", "Ctrl+Alt+9" },
+  { "Ctrl+0", "Ctrl+Alt+0" },
+  { "Ctrl+<", "Ctrl+Alt+<" },      { "Ctrl+´", "Ctrl+Alt+<" },
+  { "Ctrl+H", "Win+M" },           { "Ctrl+I", "Ctrl+Shift+C" },    { "Ctrl+Shift+7", "Alt+Shift+A" },
+};
+
+static const struct { const char *name; UINT vk; } kKeyNames[] = {
+  { "Delete", VK_DELETE }, { "Del", VK_DELETE }, { "Backspace", VK_BACK }, { "Enter", VK_RETURN },
+  { "Return", VK_RETURN }, { "Tab", VK_TAB }, { "Esc", VK_ESCAPE }, { "Escape", VK_ESCAPE },
+  { "Space", VK_SPACE }, { "Left", VK_LEFT }, { "Right", VK_RIGHT }, { "Up", VK_UP }, { "Down", VK_DOWN },
+  { "Home", VK_HOME }, { "End", VK_END }, { "PageUp", VK_PRIOR }, { "PgUp", VK_PRIOR },
+  { "PageDown", VK_NEXT }, { "PgDn", VK_NEXT }, { "Insert", VK_INSERT }, { "Ins", VK_INSERT },
+  { "PrintScreen", VK_SNAPSHOT },
+};
+
+// Parses "Ctrl+Shift+7", "Delete", "Ctrl+<", "Ctrl++" ... On failure, why says what's wrong.
+static bool parseKeySpec(const char *text, KeySpec *k, char *why, size_t whyLen) {
+  memset(k, 0, sizeof *k);
+  size_t len = strlen(text);
+  if (len == 0) { snprintf(why, whyLen, "no key given"); return false; }
+  // The key is after the last "+", except that a trailing "++" (or just "+") means the + key.
+  size_t keyStart;
+  if (text[len - 1] == '+') keyStart = len - 1;
+  else { const char *plus = strrchr(text, '+'); keyStart = plus ? (size_t)(plus - text) + 1 : 0; }
+  const char *key = text + keyStart;
+  if (!*key) { snprintf(why, whyLen, "no key after the last +"); return false; }
+
+  // modifiers: everything before the key, separated by "+"
+  char mods[48];
+  size_t modLen = keyStart ? keyStart - 1 : 0;  // drop the "+" before the key
+  if (modLen >= sizeof mods) { snprintf(why, whyLen, "too long"); return false; }
+  memcpy(mods, text, modLen);
+  mods[modLen] = 0;
+  for (char *tok = modLen ? mods : NULL, *next; tok; tok = next) {
+    next = strchr(tok, '+');
+    if (next) *next++ = 0;
+    if (_stricmp(tok, "Ctrl") == 0 || _stricmp(tok, "Control") == 0) k->mods |= KM_CTRL;
+    else if (_stricmp(tok, "Alt") == 0) k->mods |= KM_ALT;
+    else if (_stricmp(tok, "Shift") == 0) k->mods |= KM_SHIFT;
+    else if (_stricmp(tok, "Win") == 0 || _stricmp(tok, "Windows") == 0) k->mods |= KM_WIN;
+    else { snprintf(why, whyLen, "unknown modifier \"%s\" (use Ctrl, Alt, Shift or Win)", tok); return false; }
+  }
+
+  // the key: a name, a letter or digit, F1-F24, or one character typed by its own key
+  for (size_t i = 0; i < sizeof kKeyNames / sizeof *kKeyNames; i++)
+    if (_stricmp(key, kKeyNames[i].name) == 0) { k->vk = kKeyNames[i].vk; return true; }
+  if ((key[0] == 'F' || key[0] == 'f') && key[1] >= '1' && key[1] <= '9') {
+    int n = atoi(key + 1);
+    bool digits = strspn(key + 1, "0123456789") == strlen(key + 1);
+    if (digits && n >= 1 && n <= 24) { k->vk = VK_F1 + n - 1; return true; }
+  }
+  wchar_t w[4];
+  int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, key, -1, w, 4);
+  if (n == 2) {  // exactly one character (plus the terminator)
+    if (w[0] >= 'a' && w[0] <= 'z') { k->vk = w[0] - 'a' + 'A'; return true; }
+    if ((w[0] >= 'A' && w[0] <= 'Z') || (w[0] >= '0' && w[0] <= '9')) { k->vk = w[0]; return true; }
+    if (w[0] > ' ') { k->ch = w[0]; return true; }
+  }
+  snprintf(why, whyLen, "unknown key \"%s\"", key);
+  return false;
+}
+
+// One "keys you press": "keys sent instead" entry, checked. Adds it (replacing an entry
+// for the same keys) or explains why not.
+static bool addRemap(Remap *list, int *count, const char *from, const char *to, char *why, size_t whyLen) {
+  Remap r;
+  memset(&r, 0, sizeof r);
+  char reason[120];
+  if (!parseKeySpec(from, &r.from, reason, sizeof reason)) { snprintf(why, whyLen, "\"%s\": %s", from, reason); return false; }
+  if (!parseKeySpec(to, &r.to, reason, sizeof reason)) { snprintf(why, whyLen, "\"%s\": %s", to, reason); return false; }
+  if (r.from.mods & KM_WIN) {
+    snprintf(why, whyLen, "\"%s\": Win can't be used in the keys you press", from);
+    return false;
+  }
+  if (r.from.mods == KM_ALT && r.from.vk == 'W') {
+    snprintf(why, whyLen, "\"%s\": Alt+W is the Windows key and can't be changed", from);
+    return false;
+  }
+  snprintf(r.fromText, sizeof r.fromText, "%s", from);
+  snprintf(r.toText, sizeof r.toText, "%s", to);
+  for (int i = 0; i < *count; i++)
+    if (list[i].from.mods == r.from.mods && list[i].from.vk == r.from.vk && list[i].from.ch == r.from.ch) {
+      list[i] = r;
+      return true;
+    }
+  if (*count >= MAX_REMAPS) { snprintf(why, whyLen, "more than %d remaps", MAX_REMAPS); return false; }
+  list[(*count)++] = r;
+  return true;
+}
+
+static void defaultRemaps(Remap *list, int *count) {
+  char why[160];
+  *count = 0;
+  for (size_t i = 0; i < sizeof kDefaultRemaps / sizeof *kDefaultRemaps; i++)
+    addRemap(list, count, kDefaultRemaps[i][0], kDefaultRemaps[i][1], why, sizeof why);
+}
+
+static void setRemaps(const Remap *list, int count) {
+  AcquireSRWLockExclusive(&gRemapLock);
+  memcpy(gRemaps, list, sizeof(Remap) * count);
+  gRemapCount = count;
+  ReleaseSRWLockExclusive(&gRemapLock);
+}
+
 // ---------------------------------------------------------------- remaps (own thread)
 //
 // Works like AutoHotkey: low-level hooks see every key and click before apps do, can
@@ -921,10 +1055,13 @@ static bool restoreHidden(void) {
 }
 
 // AutoHotkey-style Send: modifiers that aren't part of the combination are released for
-// the moment, missing ones pressed, then everything is put back as it was.
+// the moment, missing ones pressed, then everything is put back as it was. Alt is the
+// exception: it stays hidden until released (or until another key needs it), since
+// pressing it again and then releasing it would activate the window's menu bar.
 static void sendCombo(bool ctrl, bool alt, bool shift, bool win, UINT vk) {
   const bool want[N_MODS] = { ctrl, ctrl, alt, alt, shift, shift, win, win };
   bool lifted[N_MODS] = { 0 }, pressed[N_MODS] = { 0 };
+  if (!alt && (kLog[VK_LMENU] || kLog[VK_RMENU])) { sendKey(0xE8, true); sendKey(0xE8, false); }
   for (size_t i = 0; i < N_MODS; i++)
     if (kLog[kMods[i]] && !want[i]) { sendKey(kMods[i], false); lifted[i] = true; }
   for (size_t i = 0; i < N_MODS; i += 2)  // pairs: left, right
@@ -932,7 +1069,11 @@ static void sendCombo(bool ctrl, bool alt, bool shift, bool win, UINT vk) {
   sendKey(vk, true);
   sendKey(vk, false);
   for (size_t i = 0; i < N_MODS; i++) if (pressed[i]) sendKey(kMods[i], false);
-  for (size_t i = 0; i < N_MODS; i++) if (lifted[i] && wantDown(kMods[i])) sendKey(kMods[i], true);
+  for (size_t i = 0; i < N_MODS; i++) {
+    if (!lifted[i] || !wantDown(kMods[i])) continue;
+    if (kMods[i] == VK_LMENU || kMods[i] == VK_RMENU) kSup[kMods[i]] = true;
+    else sendKey(kMods[i], true);
+  }
 }
 
 // The key that types a character on the current keyboard layout (like AutoHotkey's ^<).
@@ -943,28 +1084,32 @@ static UINT charVk(wchar_t ch, UINT fallback) {
   return (UINT)(r & 0xFF);
 }
 
-// The hotkeys. Returns true if the key was handled (and must be swallowed).
+// The key remaps. Returns true if the key was handled (and must be swallowed). Like
+// AutoHotkey hotkeys, a remap fires only with exactly its modifiers held.
 static bool runHotkey(UINT vk) {
-  bool ctrl = kLog[VK_LCONTROL] || kLog[VK_RCONTROL];
-  bool alt = kLog[VK_LMENU] || kLog[VK_RMENU];
-  bool shift = kLog[VK_LSHIFT] || kLog[VK_RSHIFT];
-  bool win = kLog[VK_LWIN] || kLog[VK_RWIN];
-  if (!ctrl || alt || win) return false;  // like AutoHotkey: exactly these modifiers
-
-  UINT lessVk = charVk(L'<', VK_OEM_102), acuteVk = charVk(L'´', VK_OEM_4);
-  if (shift) {
-    if (vk == '7') { sendCombo(false, true, true, false, 'A'); return true; }     // ^+7 -> Alt+Shift+A
-    return false;
+  BYTE mods = (kLog[VK_LCONTROL] || kLog[VK_RCONTROL] ? KM_CTRL : 0) |
+              (kLog[VK_LMENU] || kLog[VK_RMENU] ? KM_ALT : 0) |
+              (kLog[VK_LSHIFT] || kLog[VK_RSHIFT] ? KM_SHIFT : 0) |
+              (kLog[VK_LWIN] || kLog[VK_RWIN] ? KM_WIN : 0);
+  if (mods & KM_WIN) return false;
+  KeySpec out;
+  bool found = false;
+  AcquireSRWLockShared(&gRemapLock);
+  for (int i = 0; i < gRemapCount && !found; i++) {
+    const Remap *r = &gRemaps[i];
+    if (r->from.mods != mods) continue;
+    UINT fromVk = r->from.vk ? r->from.vk : charVk(r->from.ch, 0);
+    if (!fromVk || fromVk != vk) continue;
+    out = r->to;
+    found = true;
+    LOG("remap %s -> %s\n", r->fromText, r->toText);
   }
-  switch (vk) {
-    case 'D': case VK_BACK: sendCombo(false, false, false, false, VK_DELETE); return true;
-    case '2': case '3': case '4': case '7': case '8': case '9': case '0':
-      sendCombo(true, true, false, false, vk); return true;                     // AltGr symbol
-    case 'H': sendCombo(false, false, false, true, 'M'); return true;            // Win+M
-    case 'I': sendCombo(true, false, true, false, 'C'); return true;             // Ctrl+Shift+C
-  }
-  if (vk == lessVk || vk == acuteVk) { sendCombo(true, true, false, false, lessVk); return true; }  // |
-  return false;
+  ReleaseSRWLockShared(&gRemapLock);
+  if (!found) return false;
+  UINT outVk = out.vk ? out.vk : charVk(out.ch, 0);
+  if (!outVk) return false;  // that character has no key of its own on this layout
+  sendCombo(out.mods & KM_CTRL, out.mods & KM_ALT, out.mods & KM_SHIFT, out.mods & KM_WIN, outVk);
+  return true;
 }
 
 static void replayKey(const KBDLLHOOKSTRUCT *kb) {
@@ -1026,7 +1171,7 @@ static LRESULT CALLBACK keyboardHook(int code, WPARAM wp, LPARAM lp) {
   }
 
   bool restored = gWinFromW ? false : restoreHidden();  // keep Alt hidden while Win is held
-  if (runHotkey(vk)) { kSwallowUp[vk] = true; LOG("hotkey vk %02X\n", vk); return 1; }
+  if (runHotkey(vk)) { kSwallowUp[vk] = true; return 1; }
   if (restored) { replayKey(kb); return 1; }
   return CallNextHookEx(NULL, code, wp, lp);
 }
@@ -1573,7 +1718,7 @@ static void applyStartup(void) {
       int code = installed ? configureViaUac() : installViaUac();  // admin copies live in Program Files
       if (code == -1) {  // UAC prompt declined
         gRunAsAdmin = false;
-        settingsWrite();
+        settingsSetBool("runAsAdministrator", false);
         setRunEntry(gRunAtStartup ? exe : NULL);
         trayNotify(L"Run as administrator is off",
                    L"The admin prompt was declined, so Macify runs without admin rights. Turn it back on in the tray menu.");
@@ -1591,7 +1736,7 @@ static void applyStartup(void) {
       int code = configureViaUac();  // removes the task
       if (code != 0 && taskExists()) {
         gRunAsAdmin = true;
-        settingsWrite();
+        settingsSetBool("runAsAdministrator", true);
         trayNotify(L"Run as administrator is still on", L"The admin task couldn't be removed without admin rights.");
         return;
       }
@@ -1603,7 +1748,7 @@ static void applyStartup(void) {
 
 static void toggleSetting(bool *value) {
   *value = !*value;
-  settingsWrite();
+  settingsSetBool(value == &gRunAtStartup ? "runAtStartup" : "runAsAdministrator", *value);
   applyStartup();
 }
 
@@ -1698,6 +1843,9 @@ static void logState(void) {
       LOG("  %6.1f mm/s: %6.2f px/mm from %.0f mm of movement\n", binSpeed(b), gBinPx[b] / gBinMm[b], gBinMm[b]);
   LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f\n",
       gRunAtStartup, gRunAsAdmin, gSpeedMul);
+  AcquireSRWLockShared(&gRemapLock);
+  for (int i = 0; i < gRemapCount; i++) LOG("  remap %s -> %s\n", gRemaps[i].fromText, gRemaps[i].toText);
+  ReleaseSRWLockShared(&gRemapLock);
   LOG("--- events ---\n");
 }
 
@@ -1752,13 +1900,17 @@ static void debugFinish(void) {
 #define FOUND_STARTUP 1
 #define FOUND_ADMIN   2
 #define FOUND_SPEED   4
-#define FOUND_ALL     7
-#define FOUND_OBSOLETE 8  // a setting that no longer exists: rewrite the file without it
+#define FOUND_REMAPS  8
+#define FOUND_ALL     15
+#define FOUND_OBSOLETE 16  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
   bool runAtStartup, runAsAdmin;
   double speed;
-  int found;  // which settings the file had: FOUND_* bits
+  Remap remaps[MAX_REMAPS];
+  int remapCount;
+  char skipped[400];  // key remaps that couldn't be used, and why
+  int found;          // which settings the file had: FOUND_* bits
 } Settings;
 
 static FILETIME gSettingsTime;
@@ -1841,6 +1993,32 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
       st->speed = v;
       st->found |= FOUND_SPEED;
       j.p = end;
+    } else if (strcmp(key, "keyRemaps") == 0) {
+      if (*j.p != '{') { snprintf(err, errLen, "\"keyRemaps\" must be { ... } (line %d)", line); return false; }
+      j.p++;
+      st->remapCount = 0;
+      st->found |= FOUND_REMAPS;
+      for (;;) {
+        jsonSkip(&j);
+        if (*j.p == '}') { j.p++; break; }
+        char from[64], to[64], why[160];
+        int entryLine = jsonLine(&j);
+        if (!jsonString(&j, from, sizeof from)) { snprintf(err, errLen, "expected \"keys\" in keyRemaps at line %d", entryLine); return false; }
+        jsonSkip(&j);
+        if (*j.p != ':') { snprintf(err, errLen, "expected : after \"%s\" at line %d", from, entryLine); return false; }
+        j.p++;
+        jsonSkip(&j);
+        if (!jsonString(&j, to, sizeof to)) { snprintf(err, errLen, "\"%s\" needs \"keys\" to send (line %d)", from, entryLine); return false; }
+        if (!addRemap(st->remaps, &st->remapCount, from, to, why, sizeof why)) {
+          size_t used = strlen(st->skipped);
+          snprintf(st->skipped + used, sizeof st->skipped - used, "%s%s (line %d)", used ? "; " : "", why, entryLine);
+        }
+        jsonSkip(&j);
+        if (*j.p == ',') { j.p++; continue; }
+        if (*j.p == '}') { j.p++; break; }
+        snprintf(err, errLen, "expected , or } in keyRemaps at line %d", jsonLine(&j));
+        return false;
+      }
     } else {  // unknown key: skip its value
       char tmp[256];
       if (*j.p == '"') { if (!jsonString(&j, tmp, sizeof tmp)) { snprintf(err, errLen, "unfinished text at line %d", line); return false; } }
@@ -1857,8 +2035,43 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
 
 static bool settingsPath(wchar_t *path) { return dataFile(path, L"settings.json"); }
 
-// Writes the current settings to settings.json (used by the tray menu, and to add
-// settings a file from an older version doesn't have yet).
+static const char kSettingsHelp[] =
+  "// Macify settings. Changes apply as soon as you save this file.\n"
+  "//\n"
+  "// runAtStartup: start Macify when you log in (true or false).\n"
+  "// runAsAdministrator: run with admin rights, so it also works in admin windows.\n"
+  "// threeFingerDragSpeed: multiplies the three-finger drag speed (1.0 = normal pointer).\n"
+  "//\n"
+  "// keyRemaps: \"keys you press\": \"keys sent instead\"\n"
+  "//   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
+  "//   Modifiers: Ctrl, Alt, Shift, Win\n"
+  "//   Keys: A-Z, 0-9, F1-F24, Delete, Backspace, Enter, Tab, Esc, Space, Left, Right,\n"
+  "//         Up, Down, Home, End, PageUp, PageDown, Insert, PrintScreen, or a character\n"
+  "//         that has its own key on your keyboard layout, like < or ´ (+ is written Ctrl++)\n"
+  "//   In the keys you press, Ctrl also means the left Windows key, and Win can't be used.\n"
+  "//   A remap only happens with exactly those modifiers held: Ctrl+D isn't Ctrl+Shift+D.\n"
+  "//   Delete keyRemaps to get the default remaps back; \"keyRemaps\": {} turns them all off.\n"
+  "//\n"
+  "// Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"
+  "// Windows key, and Ctrl+click or Alt+click is a right-click.\n";
+
+// A JSON string, with " and \ escaped.
+static void jsonPut(FILE *f, const char *text) {
+  fputc('"', f);
+  for (; *text; text++) {
+    if (*text == '"' || *text == '\\') fputc('\\', f);
+    fputc(*text, f);
+  }
+  fputc('"', f);
+}
+
+static void markOwnWrite(const wchar_t *path) {
+  WIN32_FILE_ATTRIBUTE_DATA a;  // our own write: not a change to react to
+  if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) gSettingsTime = a.ftLastWriteTime;
+}
+
+// Writes all current settings to settings.json, with the explanation at the top. Used to
+// create the file and to bring a file from an older version up to date.
 static void settingsWrite(void) {
   wchar_t path[MAX_PATH];
   if (!settingsPath(path)) return;
@@ -1866,15 +2079,58 @@ static void settingsWrite(void) {
   snprintf(speed, sizeof speed, gSpeedMul == floor(gSpeedMul) ? "%.1f" : "%g", gSpeedMul);
   FILE *f = _wfopen(path, L"wb");
   if (!f) return;
-  fprintf(f, "{\n"
+  fprintf(f, "%s{\n"
              "  \"runAtStartup\": %s,\n"
              "  \"runAsAdministrator\": %s,\n"
-             "  \"threeFingerDragSpeed\": %s\n"
-             "}\n",
-          gRunAtStartup ? "true" : "false", gRunAsAdmin ? "true" : "false", speed);
+             "  \"threeFingerDragSpeed\": %s,\n"
+             "  \"keyRemaps\": {",
+          kSettingsHelp, gRunAtStartup ? "true" : "false", gRunAsAdmin ? "true" : "false", speed);
+  AcquireSRWLockShared(&gRemapLock);
+  for (int i = 0; i < gRemapCount; i++) {
+    fprintf(f, "%s\n    ", i ? "," : "");
+    jsonPut(f, gRemaps[i].fromText);
+    fputs(": ", f);
+    jsonPut(f, gRemaps[i].toText);
+  }
+  ReleaseSRWLockShared(&gRemapLock);
+  fprintf(f, "%s}\n}\n", gRemapCount ? "\n  " : "");
   fclose(f);
-  WIN32_FILE_ATTRIBUTE_DATA a;  // our own write: not a change to react to
-  if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) gSettingsTime = a.ftLastWriteTime;
+  markOwnWrite(path);
+}
+
+// Changes one true/false setting in place, keeping the rest of the file (comments,
+// order, your own formatting) as it is. Falls back to rewriting the file.
+static void settingsSetBool(const char *name, bool value) {
+  wchar_t path[MAX_PATH];
+  if (!settingsPath(path)) return;
+  char text[8192], pattern[64];
+  FILE *f = _wfopen(path, L"rb");
+  size_t n = f ? fread(text, 1, sizeof text - 1, f) : 0;
+  if (f) fclose(f);
+  text[n] = 0;
+  snprintf(pattern, sizeof pattern, "\"%s\"", name);
+  for (char *k = strstr(text, pattern); k; k = strstr(k + 1, pattern)) {
+    char *line = k;  // skip mentions inside // comments
+    while (line > text && line[-1] != '\n') line--;
+    while (*line == ' ' || *line == '\t') line++;
+    if (line[0] == '/' && line[1] == '/') continue;
+    char *v = k + strlen(pattern);
+    while (*v == ' ' || *v == '\t') v++;
+    if (*v != ':') continue;
+    v++;
+    while (*v == ' ' || *v == '\t') v++;
+    size_t oldLen = strncmp(v, "true", 4) == 0 ? 4 : strncmp(v, "false", 5) == 0 ? 5 : 0;
+    if (!oldLen) break;
+    f = _wfopen(path, L"wb");
+    if (!f) return;
+    fwrite(text, 1, (size_t)(v - text), f);
+    fputs(value ? "true" : "false", f);
+    fputs(v + oldLen, f);
+    fclose(f);
+    markOwnWrite(path);
+    return;
+  }
+  settingsWrite();
 }
 
 // Loads settings.json if it changed since last time (creating it with the defaults if
@@ -1883,7 +2139,14 @@ static void settingsLoad(bool userEdit) {
   wchar_t path[MAX_PATH];
   if (!settingsPath(path)) return;
   WIN32_FILE_ATTRIBUTE_DATA a;
-  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) { settingsWrite(); return; }
+  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) {  // first run: create it
+    static Remap defaults[MAX_REMAPS];
+    int count;
+    defaultRemaps(defaults, &count);
+    setRemaps(defaults, count);
+    settingsWrite();
+    return;
+  }
   if (CompareFileTime(&a.ftLastWriteTime, &gSettingsTime) == 0) return;  // unchanged
   gSettingsTime = a.ftLastWriteTime;
 
@@ -1895,7 +2158,10 @@ static void settingsLoad(bool userEdit) {
   text[n] = 0;
   if (n == 0 && userEdit) return;  // editors sometimes truncate before writing: wait for the real save
 
-  Settings st = { true, true, 1.0, 0 };  // defaults for anything the file leaves out
+  static Settings st;  // big (the remap list): not on the stack
+  memset(&st, 0, sizeof st);
+  st.runAtStartup = st.runAsAdmin = true;  // defaults for anything the file leaves out
+  st.speed = 1.0;
   char err[160];
   if (!parseSettings(text, &st, err, sizeof err)) {
     LOG("settings.json not applied: %s\n", err);
@@ -1903,17 +2169,29 @@ static void settingsLoad(bool userEdit) {
     if (gWnd) { trayNotify(L"Macify settings not applied", gSettingsError); gSettingsError[0] = 0; }
     return;
   }
+  if (!(st.found & FOUND_REMAPS)) defaultRemaps(st.remaps, &st.remapCount);
   bool dragChanged = st.speed != gSpeedMul;
   bool startupChanged = st.runAtStartup != gRunAtStartup || st.runAsAdmin != gRunAsAdmin;
+  AcquireSRWLockShared(&gRemapLock);
+  bool remapsChanged = st.remapCount != gRemapCount ||
+                       memcmp(st.remaps, gRemaps, sizeof(Remap) * st.remapCount) != 0;
+  ReleaseSRWLockShared(&gRemapLock);
   gRunAtStartup = st.runAtStartup;
   gRunAsAdmin = st.runAsAdmin;
   gSpeedMul = st.speed;
-  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f\n",
-      gRunAtStartup, gRunAsAdmin, gSpeedMul);
-  if (st.found != FOUND_ALL) settingsWrite();  // from an older version: add missing settings, drop removed ones
-  if (userEdit && dragChanged) {
+  setRemaps(st.remaps, st.remapCount);
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f, %d key remaps\n",
+      gRunAtStartup, gRunAsAdmin, gSpeedMul, gRemapCount);
+  if (st.skipped[0]) LOG("settings: skipped %s\n", st.skipped);
+  // From an older version: add missing settings (and the explanation), drop removed ones.
+  if (st.found != FOUND_ALL || (st.found & FOUND_OBSOLETE)) settingsWrite();
+
+  if (st.skipped[0]) {
+    _snwprintf(gSettingsError, 256, L"Skipped %hs. The other settings are applied.", st.skipped);
+    if (gWnd) { trayNotify(L"Some key remaps were skipped", gSettingsError); gSettingsError[0] = 0; }
+  } else if (userEdit && (dragChanged || remapsChanged)) {
     wchar_t msg[160];
-    _snwprintf(msg, 160, L"Three-finger drag speed: %.2fx.", gSpeedMul);
+    _snwprintf(msg, 160, L"%d key remaps active. Three-finger drag speed: %.2fx.", gRemapCount, gSpeedMul);
     trayNotify(L"Macify settings applied", msg);
   }
   if (userEdit && startupChanged && gWnd) applyStartup();
@@ -2275,7 +2553,7 @@ static int run(void) {
     } else if (result == -1) {  // UAC declined: run from here, without admin rights, and don't ask again
       setInstallDeclined(true);
       gRunAsAdmin = false;
-      settingsWrite();
+      settingsSetBool("runAsAdministrator", false);
     } else {
       MessageBoxW(NULL, L"Macify couldn't be installed in Program Files.\n\n"
                         L"If it is running, quit it from its tray icon, then run this again.",
@@ -2341,7 +2619,7 @@ static int run(void) {
   gIcon = makeIcon();
   trayAdd();
   cleanUpdateDownloads();
-  if (gSettingsError[0]) { trayNotify(L"Macify settings not applied", gSettingsError); gSettingsError[0] = 0; }
+  if (gSettingsError[0]) { trayNotify(L"Macify settings", gSettingsError); gSettingsError[0] = 0; }
   applyStartup();
   if (takeFlag(L"just-updated")) {
     wchar_t msg[96];
