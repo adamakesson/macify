@@ -423,7 +423,11 @@ static void learnObserve(double dx, double dy, double dtMs) {
   gWin.fx += dx;
   gWin.fy += dy;
   gWin.ms += dtMs;
+  // Slow movement gets a longer window, up to 200 ms, so it covers enough distance to
+  // measure: in 50 ms the slowest speed range (4-5.5 mm/s) is under the 0.3 mm minimum,
+  // which is why it was never learned.
   if (gWin.ms < LEARN_WINDOW_MS) return;
+  if (hypot(gWin.fx, gWin.fy) < 0.6 && gWin.ms < 4 * LEARN_WINDOW_MS) return;
 
   POINT now;
   GetCursorPos(&now);
