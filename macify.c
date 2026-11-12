@@ -1842,54 +1842,61 @@ static void toggleSetting(bool *value) {
   applyStartup();
 }
 
-// ---------------------------------------------------------------- dark title bars
+// ---------------------------------------------------------------- title bar colors
 //
-// Windows of the apps in "darkTitleBarApps" get a dark title bar (white text and buttons)
-// in the "darkTitleBarColor" color, set from outside the app like Mica For Everyone does.
-// Windows reports each window as it's shown, so this costs nothing while none open.
+// Windows of the apps in "titleBarColors" get a title bar in that app's color, set from
+// outside the app like Mica For Everyone does, with white or black text and buttons
+// (whichever is readable on that color). Windows reports each window as it's shown, so
+// this costs nothing while none open.
 
 #define MAX_TB_APPS 32
 static wchar_t gTbApps[MAX_TB_APPS][64];  // program file names, like Plex.exe
+static COLORREF gTbColors[MAX_TB_APPS];
 static int gTbAppCount;
-static COLORREF gTbColor = RGB(0x20, 0x20, 0x20);
 static HWINEVENTHOOK gTbHook;
 
-static bool tbWanted(HWND w) {
-  if (!gTbAppCount || GetAncestor(w, GA_ROOT) != w || !(GetWindowLongW(w, GWL_STYLE) & WS_CAPTION)) return false;
+// The app's index in titleBarColors, or -1.
+static int tbAppFor(HWND w) {
+  if (!gTbAppCount || GetAncestor(w, GA_ROOT) != w || !(GetWindowLongW(w, GWL_STYLE) & WS_CAPTION)) return -1;
   DWORD pid = 0;
   GetWindowThreadProcessId(w, &pid);
   HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (!p) return false;
+  if (!p) return -1;
   wchar_t path[MAX_PATH];
   DWORD n = MAX_PATH;
   bool ok = QueryFullProcessImageNameW(p, 0, path, &n);
   CloseHandle(p);
-  if (!ok) return false;
+  if (!ok) return -1;
   const wchar_t *name = wcsrchr(path, L'\\');
   name = name ? name + 1 : path;
   for (int i = 0; i < gTbAppCount; i++)
-    if (!_wcsicmp(name, gTbApps[i])) return true;
-  return false;
+    if (!_wcsicmp(name, gTbApps[i])) return i;
+  return -1;
 }
 
-static void tbApply(HWND w) {
-  BOOL dark = TRUE;
+static void tbApply(HWND w, COLORREF color) {
+  double lum = 0.299 * GetRValue(color) + 0.587 * GetGValue(color) + 0.114 * GetBValue(color);
+  BOOL dark = lum < 140;  // dark mode: white text and buttons
   if (FAILED(DwmSetWindowAttribute(w, 20, &dark, sizeof dark)))  // DWMWA_USE_IMMERSIVE_DARK_MODE
     DwmSetWindowAttribute(w, 19, &dark, sizeof dark);              // its number before Windows 10 20H1
-  DwmSetWindowAttribute(w, 35, &gTbColor, sizeof gTbColor);        // DWMWA_CAPTION_COLOR (Windows 11)
+  COLORREF text = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
+  DwmSetWindowAttribute(w, 35, &color, sizeof color);              // DWMWA_CAPTION_COLOR (Windows 11)
+  DwmSetWindowAttribute(w, 36, &text, sizeof text);                // DWMWA_TEXT_COLOR (Windows 11)
 }
 
 static void CALLBACK tbEvent(HWINEVENTHOOK h, DWORD ev, HWND w, LONG obj, LONG child, DWORD thread, DWORD time) {
   (void)h; (void)ev; (void)thread; (void)time;
-  if (w && obj == OBJID_WINDOW && child == CHILDID_SELF && tbWanted(w)) {
-    tbApply(w);
-    LOG("dark title bar: applied to a new window\n");
+  int app;
+  if (w && obj == OBJID_WINDOW && child == CHILDID_SELF && (app = tbAppFor(w)) >= 0) {
+    tbApply(w, gTbColors[app]);
+    LOG("title bar color: applied to a new window\n");
   }
 }
 
 static BOOL CALLBACK tbEnum(HWND w, LPARAM lp) {
   (void)lp;
-  if (IsWindowVisible(w) && tbWanted(w)) tbApply(w);
+  int app = IsWindowVisible(w) ? tbAppFor(w) : -1;
+  if (app >= 0) tbApply(w, gTbColors[app]);
   return TRUE;
 }
 
@@ -2141,9 +2148,8 @@ static void debugFinish(void) {
 #define FOUND_REMAPS  8
 #define FOUND_UPDATES 16
 #define FOUND_JUMP    32
-#define FOUND_TBAPPS  64
-#define FOUND_TBCOLOR 128
-#define FOUND_ALL     255
+#define FOUND_TBCOLORS 64
+#define FOUND_ALL     127
 #define FOUND_OBSOLETE 1024  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
@@ -2152,8 +2158,9 @@ typedef struct {
   Remap remaps[MAX_REMAPS];
   int remapCount;
   char tbApps[MAX_TB_APPS][64];
+  COLORREF tbColors[MAX_TB_APPS];
   int tbAppCount;
-  COLORREF tbColor;
+  COLORREF tbOldColor;  // darkTitleBarColor (1.20 only), for converting to titleBarColors
   char skipped[400];  // key remaps that couldn't be used, and why
   int found;          // which settings the file had: FOUND_* bits
 } Settings;
@@ -2341,20 +2348,41 @@ static bool yamlBool(const char *v, bool *out) {
   return false;
 }
 
-// Adds one darkTitleBarApps entry.
-static bool tbAddApp(Settings *st, const char *raw, int lineNo, char *err, size_t errLen) {
-  char name[64];
-  if (!yamlScalar(yamlTrim((char *)raw), name, sizeof name)) { snprintf(err, errLen, "a quote isn't closed on line %d", lineNo); return false; }
-  if (!*name) return true;
-  if (st->tbAppCount >= MAX_TB_APPS) { snprintf(err, errLen, "darkTitleBarApps can have at most %d apps (line %d)", MAX_TB_APPS, lineNo); return false; }
-  snprintf(st->tbApps[st->tbAppCount++], 64, "%s", name);
+#define TB_OLD_COLOR 0xFFFFFFFF  // placeholder: darkTitleBarColor, filled in after parsing
+
+static bool tbParseColor(const char *v, COLORREF *out) {
+  const char *hex = v[0] == '#' ? v + 1 : v;
+  char *end;
+  unsigned long rgb = strtoul(hex, &end, 16);
+  if (strlen(hex) != 6 || *end) return false;
+  *out = RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
   return true;
+}
+
+// Adds one app (to titleBarColors, or darkTitleBarApps from 1.20).
+static bool tbAddApp(Settings *st, const char *name, COLORREF color, int lineNo, char *err, size_t errLen) {
+  if (!*name) return true;
+  if (st->tbAppCount >= MAX_TB_APPS) { snprintf(err, errLen, "titleBarColors can have at most %d apps (line %d)", MAX_TB_APPS, lineNo); return false; }
+  snprintf(st->tbApps[st->tbAppCount], 64, "%s", name);
+  st->tbColors[st->tbAppCount++] = color;
+  return true;
+}
+
+// One "App.exe: "#RRGGBB"" line under titleBarColors. A color without quotes has already
+// been cut off as a comment, so an empty color gets that hint.
+static bool tbAddEntry(Settings *st, const char *app, const char *color, int lineNo, char *err, size_t errLen) {
+  COLORREF c;
+  if (!tbParseColor(color, &c)) {
+    snprintf(err, errLen, "the color for %s must be like \"#202020\", with the quotes (line %d)", app, lineNo);
+    return false;
+  }
+  return tbAddApp(st, app, c, lineNo, err, errLen);
 }
 
 static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t errLen) {
   static char buf[8192];
   snprintf(buf, sizeof buf, "%s", text);
-  bool inRemaps = false, inApps = false;
+  bool inRemaps = false, inColors = false, inOldApps = false;
   int lineNo = 0;
   for (char *line = buf, *next; line; line = next) {
     next = strchr(line, '\n');
@@ -2365,16 +2393,15 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
     bool indented = line[0] == ' ' || line[0] == '\t';
     char *content = yamlTrim(line);
     if (!*content) continue;
-    if (content[0] == '-' && (content[1] == ' ' || content[1] == 0)) {  // a list entry
-      if (!inApps) { snprintf(err, errLen, "line %d is a list entry (- ...), but isn't under darkTitleBarApps", lineNo); return false; }
-      if (!tbAddApp(st, content + 1, lineNo, err, errLen)) return false;
+    bool listEntry = content[0] == '-' && (content[1] == ' ' || content[1] == 0);
+    if (listEntry && inOldApps) {  // darkTitleBarApps (1.20):  - Plex.exe
+      char name[64];
+      if (!yamlScalar(yamlTrim(content + 1), name, sizeof name)) { snprintf(err, errLen, "a quote isn't closed on line %d", lineNo); return false; }
+      if (!tbAddApp(st, name, TB_OLD_COLOR, lineNo, err, errLen)) return false;
       continue;
     }
-    // darkTitleBarColor: #202020 without quotes would be read as a comment
-    if (!strncmp(content, "darkTitleBarColor:", 18) && !*yamlTrim(content + 18)) {
-      snprintf(err, errLen, "darkTitleBarColor needs a color in quotes, like \"#202020\" (line %d)", lineNo);
-      return false;
-    }
+    if (listEntry && inColors) content = yamlTrim(content + 1);  // also accept  - Plex.exe: "#202020"
+    else if (listEntry) { snprintf(err, errLen, "line %d is a list entry (- ...), which isn't used here", lineNo); return false; }
 
     char *rawKey, *rawValue, key[64], value[64];
     if (!yamlSplit(content, &rawKey, &rawValue)) {
@@ -2387,6 +2414,10 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       return false;
     }
 
+    if ((indented || listEntry) && inColors) {
+      if (!tbAddEntry(st, key, value, lineNo, err, errLen)) return false;
+      continue;
+    }
     if (indented) {  // an entry under keyRemaps
       if (!inRemaps) { snprintf(err, errLen, "line %d is indented, but isn't under keyRemaps", lineNo); return false; }
       char why[160];
@@ -2398,34 +2429,33 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       continue;
     }
 
-    inRemaps = inApps = false;
-    if (!strcmp(key, "darkTitleBarApps")) {
-      st->found |= FOUND_TBAPPS;
+    inRemaps = inColors = inOldApps = false;
+    if (!strcmp(key, "titleBarColors")) {
+      if (*value && strcmp(rawValue, "{}") != 0) {
+        snprintf(err, errLen, "titleBarColors (line %d) should be followed by indented lines like  Plex.exe: \"#202020\"", lineNo);
+        return false;
+      }
+      st->found |= FOUND_TBCOLORS;
       st->tbAppCount = 0;
-      if (!*value) { inApps = true; continue; }
-      char list[256];  // [A.exe, B.exe] on one line
+      inColors = !*value;
+    } else if (!strcmp(key, "darkTitleBarApps")) {  // 1.20: converted to titleBarColors
+      st->found |= FOUND_OBSOLETE;
+      inOldApps = !*value;
+      char list[256];  // or [A.exe, B.exe]
       snprintf(list, sizeof list, "%s", rawValue);
       size_t len = strlen(list);
-      if (list[0] != '[' || list[len - 1] != ']') {
-        snprintf(err, errLen, "darkTitleBarApps (line %d) should be followed by indented lines like  - Plex.exe, or be []", lineNo);
-        return false;
+      if (len >= 2 && list[0] == '[' && list[len - 1] == ']') {
+        list[len - 1] = 0;
+        for (char *item = list + 1, *comma; item; item = comma) {
+          comma = strchr(item, ',');
+          if (comma) *comma++ = 0;
+          char name[64];
+          if (yamlScalar(yamlTrim(item), name, sizeof name) && !tbAddApp(st, name, TB_OLD_COLOR, lineNo, err, errLen)) return false;
+        }
       }
-      list[len - 1] = 0;
-      for (char *item = list + 1, *comma; item; item = comma) {
-        comma = strchr(item, ',');
-        if (comma) *comma++ = 0;
-        if (!tbAddApp(st, item, lineNo, err, errLen)) return false;
-      }
-    } else if (!strcmp(key, "darkTitleBarColor")) {
-      const char *hex = value[0] == '#' ? value + 1 : value;
-      char *end;
-      unsigned long rgb = strtoul(hex, &end, 16);
-      if (strlen(hex) != 6 || *end) {
-        snprintf(err, errLen, "darkTitleBarColor must be a color like \"#202020\", with the quotes (line %d)", lineNo);
-        return false;
-      }
-      st->tbColor = RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
-      st->found |= FOUND_TBCOLOR;
+    } else if (!strcmp(key, "darkTitleBarColor")) {  // 1.20
+      st->found |= FOUND_OBSOLETE;
+      tbParseColor(value, &st->tbOldColor);
     } else if (!strcmp(key, "keyRemaps")) {
       if (*value && strcmp(rawValue, "{}") != 0) {
         snprintf(err, errLen, "keyRemaps (line %d) should be followed by indented lines like  Ctrl+D: Delete", lineNo);
@@ -2463,6 +2493,8 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       LOG("settings: ignoring unknown \"%s\"\n", key);
     }
   }
+  for (int i = 0; i < st->tbAppCount; i++)
+    if (st->tbColors[i] == TB_OLD_COLOR) st->tbColors[i] = st->tbOldColor;
   return true;
 }
 
@@ -2484,15 +2516,14 @@ static const char kHelpJump[] =
   "# between two touchpad reports is held back until it's clear whether it was real. It never\n"
   "# limits how fast you can drag. 0 (the default) turns this off. If your cursor jumps when\n"
   "# you start a drag fast, try 3.\n";
-static const char kHelpTbApps[] =
-  "# Apps whose title bar is made dark, with white text and buttons. One indented line each\n"
-  "# with the app's program file name (see Task Manager > Details), like:\n"
-  "#   darkTitleBarApps:\n"
-  "#     - Plex.exe\n"
-  "# [] means none.\n";
-static const char kHelpTbColor[] =
-  "# Background color of those title bars, as \"#RRGGBB\" with the quotes. Windows 11 only:\n"
-  "# Windows 10 uses its own dark color.\n";
+static const char kHelpTbColors[] =
+  "# Title bar colors for apps, such as apps that keep a light title bar in dark mode. One\n"
+  "# indented line each: the app's program file name (see Task Manager > Details), then the\n"
+  "# color as \"#RRGGBB\" with the quotes. Text and buttons turn white or black, whichever is\n"
+  "# readable on that color. Windows 11 only. Like:\n"
+  "#   titleBarColors:\n"
+  "#     Plex.exe: \"#202020\"\n"
+  "# {} means none.\n";
 static const char kHelpRemaps[] =
   "# Key remaps, one indented line each:  keys you press: keys sent instead\n"
   "#   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
@@ -2526,14 +2557,14 @@ static void markOwnWrite(const wchar_t *path) {
   if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) gSettingsTime = a.ftLastWriteTime;
 }
 
-static void tbPutApps(FILE *f) {
-  fputs(gTbAppCount ? "darkTitleBarApps:\n" : "darkTitleBarApps: []\n", f);
+static void tbPutColors(FILE *f) {
+  fputs(gTbAppCount ? "titleBarColors:\n" : "titleBarColors: {}\n", f);
   for (int i = 0; i < gTbAppCount; i++) {
     char name[64];
     snprintf(name, sizeof name, "%ls", gTbApps[i]);
-    fputs("  - ", f);
+    fputs("  ", f);
     yamlPut(f, name);
-    fputc('\n', f);
+    fprintf(f, ": \"#%02X%02X%02X\"\n", GetRValue(gTbColors[i]), GetGValue(gTbColors[i]), GetBValue(gTbColors[i]));
   }
 }
 
@@ -2551,10 +2582,9 @@ static void settingsWrite(void) {
   fprintf(f, "%s\n%srunAtStartup: %s\n\n%srunAsAdministrator: %s\n\n%scheckForUpdatesOnStart: %s\n\n"
              "%sthreeFingerDragSpeed: %s\n\n%sthreeFingerDragJumpThreshold: %s\n\n%s",
           kHelpTop, kHelpStartup, gRunAtStartup ? "true" : "false", kHelpAdmin, gRunAsAdmin ? "true" : "false",
-          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpJump, jump, kHelpTbApps);
-  tbPutApps(f);
-  fprintf(f, "\n%sdarkTitleBarColor: \"#%02X%02X%02X\"\n\n%s", kHelpTbColor,
-          GetRValue(gTbColor), GetGValue(gTbColor), GetBValue(gTbColor), kHelpRemaps);
+          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpJump, jump, kHelpTbColors);
+  tbPutColors(f);
+  fprintf(f, "\n%s", kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
   fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
@@ -2640,32 +2670,30 @@ static void settingsApply(Settings *st, bool userEdit) {
   gSpeedMul = st->speed;
   gJumpMm = st->jump;
   setRemaps(st->remaps, st->remapCount);
-  bool tbChanged = st->tbColor != gTbColor || st->tbAppCount != gTbAppCount;
+  bool tbChanged = st->tbAppCount != gTbAppCount;
   for (int i = 0; i < st->tbAppCount; i++) {
     wchar_t name[64];
     _snwprintf(name, 64, L"%hs", st->tbApps[i]);
-    if (i >= gTbAppCount || wcscmp(name, gTbApps[i])) tbChanged = true;
+    if (i >= gTbAppCount || wcscmp(name, gTbApps[i]) || st->tbColors[i] != gTbColors[i]) tbChanged = true;
     wcscpy(gTbApps[i], name);
+    gTbColors[i] = st->tbColors[i];
   }
   gTbAppCount = st->tbAppCount;
-  gTbColor = st->tbColor;
   titleBarsUpdate();
   LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, threeFingerDragSpeed %.2f, "
-      "threeFingerDragJumpThreshold %.1f, %d dark title bar apps, %d key remaps\n", gRunAtStartup, gRunAsAdmin, gCheckUpdates,
+      "threeFingerDragJumpThreshold %.1f, %d title bar colors, %d key remaps\n", gRunAtStartup, gRunAsAdmin, gCheckUpdates,
       gSpeedMul, gJumpMm, gTbAppCount, gRemapCount);
   if (st->skipped[0]) LOG("settings: skipped %s\n", st->skipped);
   // From an older version: add missing settings (and the explanation), drop removed ones.
   // Settings added since: insert just those, keeping the user's file (and comments) as is.
   int missing = FOUND_ALL & ~st->found;
-  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBAPPS | FOUND_TBCOLOR))) {
+  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBCOLORS))) {
     if (missing & FOUND_UPDATES)
       settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Multiplies the three-finger drag speed");
     if (missing & FOUND_JUMP)
       settingsInsertLine(kHelpJump, "threeFingerDragJumpThreshold: 0", "# Key remaps");
-    if (missing & FOUND_TBAPPS)
-      settingsInsertLine(kHelpTbApps, "darkTitleBarApps: []", (st->found & FOUND_TBCOLOR) ? "# Background color of those" : "# Key remaps");
-    if (missing & FOUND_TBCOLOR)
-      settingsInsertLine(kHelpTbColor, "darkTitleBarColor: \"#202020\"", "# Key remaps");
+    if (missing & FOUND_TBCOLORS)
+      settingsInsertLine(kHelpTbColors, "titleBarColors: {}", "# Key remaps");
   } else if (st->found != FOUND_ALL) {
     settingsWrite();
   }
@@ -2675,7 +2703,7 @@ static void settingsApply(Settings *st, bool userEdit) {
     if (gWnd) { trayNotify(L"Some key remaps were skipped", gSettingsError); gSettingsError[0] = 0; }
   } else if (userEdit && (dragChanged || remapsChanged || tbChanged)) {
     wchar_t msg[200];
-    _snwprintf(msg, 200, L"%d key remaps active. Drag speed %.2fx, jump threshold %g mm%ls. Dark title bars for %d apps.",
+    _snwprintf(msg, 200, L"%d key remaps active. Drag speed %.2fx, jump threshold %g mm%ls. Title bar colors for %d apps.",
                gRemapCount, gSpeedMul, gJumpMm, gJumpMm <= 0 ? L" (off)" : L"", gTbAppCount);
     trayNotify(L"Macify settings applied", msg);
   }
@@ -2687,7 +2715,7 @@ static void settingsDefaults(Settings *st) {
   st->runAtStartup = st->runAsAdmin = st->checkUpdates = true;  // for anything the file leaves out
   st->speed = 1.0;
   st->jump = 0;  // off: only some touchpads need it
-  st->tbColor = RGB(0x20, 0x20, 0x20);
+  st->tbOldColor = RGB(0x20, 0x20, 0x20);
 }
 
 static size_t readSmallFile(const wchar_t *path, char *text, size_t size) {

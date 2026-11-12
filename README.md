@@ -21,8 +21,8 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
   in the settings file (see [Key remaps](#key-remaps)).
 - **Ctrl+click and Alt+click** give a plain right-click, and a three-finger drag started
   with Ctrl or Alt held is a right-button drag.
-- **Dark title bars** for apps that don't follow Windows' dark mode (see
-  [Dark title bars](#dark-title-bars)).
+- **Title bar colors** for apps that don't follow Windows' dark mode (see
+  [Title bar colors](#title-bar-colors)).
 
 ## Three-finger drag
 
@@ -105,26 +105,24 @@ Holding the **physical Ctrl key** or **Alt** while clicking gives apps a plain r
 like Control+click on a Mac (Win+click stays Ctrl+click). A three-finger drag started with
 Ctrl or Alt held is a right-button drag. This is always on.
 
-## Dark title bars
+## Title bar colors
 
 Some apps keep a light title bar even when Windows is in dark mode. List them under
-`darkTitleBarApps` in the [settings file](#settings) and Macify gives their windows a dark
-title bar with white text and buttons, in the color set by `darkTitleBarColor`
-(`"#202020"` by default), the way Mica For Everyone does:
+`titleBarColors` in the [settings file](#settings), each with a color, and Macify gives
+their windows a title bar in that color, the way Mica For Everyone does:
 
 ```yaml
-darkTitleBarApps:
-  - Plex.exe
-darkTitleBarColor: "#202020"
+titleBarColors:
+  Plex.exe: "#202020"
 ```
 
 - Write each app's program file name, as shown in Task Manager → Details.
-- The color is `"#RRGGBB"`, with the quotes (otherwise YAML reads `#` as a comment). The
-  color only works on Windows 11; Windows 10 uses its own dark color.
-- It only works for apps with the normal Windows title bar. Windows of an app you remove
-  from the list keep the dark title bar until they're closed.
+- The color is `"#RRGGBB"`, with the quotes (otherwise YAML reads `#` as a comment).
+- The text and buttons turn white or black, whichever is readable on that color.
+- Windows 11 only, and only for apps with the normal Windows title bar. Windows of an app
+  you remove from the list keep the color until they're closed.
 
-The list is empty by default.
+`titleBarColors: {}` (the default) means none.
 
 ## Setup
 
@@ -153,8 +151,7 @@ runAsAdministrator: true
 checkForUpdatesOnStart: true
 threeFingerDragSpeed: 1.0
 threeFingerDragJumpThreshold: 0
-darkTitleBarApps: []
-darkTitleBarColor: "#202020"
+titleBarColors: {}
 keyRemaps:
   Ctrl+D: Delete
   # ... the other key remaps
@@ -170,8 +167,7 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `checkForUpdatesOnStart` | Shortly after Macify starts, check here for a newer version. If there is one, it's downloaded in the background and a notification offers it: click it, or choose **Install Macify …** in the tray menu. Silent when there's nothing new |
 | `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
 | `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` (the default) turns it off; if your cursor jumps when you start a drag fast, try `3` |
-| `darkTitleBarApps` | Apps that get a dark title bar, see [Dark title bars](#dark-title-bars). `[]` (the default) means none |
-| `darkTitleBarColor` | Background color of those title bars, like `"#202020"` (the default) |
+| `titleBarColors` | Apps whose title bar gets a color, see [Title bar colors](#title-bar-colors). `{}` (the default) means none |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
 
 ## Debug mode
