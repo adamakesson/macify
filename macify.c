@@ -78,6 +78,7 @@
 #include <objbase.h>
 #include <hidusage.h>
 #include <hidpi.h>
+#include <dwmapi.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -140,6 +141,7 @@
 #define ID_AUTOUPDATE 107
 #define UNINSTALL_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Macify"
 #define WM_UPDATE_RESULT (WM_APP + 5)
+#define WM_DEBUG_ESCAPE (WM_APP + 6)
 #define UPDATE_API L"https://api.github.com/repos/adamakesson/macify/releases/latest"
 
 // speed-curve learning
@@ -1170,6 +1172,13 @@ static LRESULT CALLBACK keyboardHook(int code, WPARAM wp, LPARAM lp) {
   if (kb->dwExtraInfo == INPUT_MAGIC || vk >= 256) return CallNextHookEx(NULL, code, wp, lp);
   // AltGr sends a fake left Ctrl along with right Alt: leave it alone (but note it).
   if (vk == VK_LCONTROL && (kb->scanCode & 0x200)) { gAltGrDown = down; return CallNextHookEx(NULL, code, wp, lp); }
+  // In debug mode, Esc finishes it (and does nothing else, press and release).
+  static bool escForDebug;
+  if (vk == VK_ESCAPE && (gDebugOn || escForDebug)) {
+    if (down && !escForDebug) { escForDebug = true; PostMessageW(gWnd, WM_DEBUG_ESCAPE, 0, 0); }
+    if (!down) escForDebug = false;
+    return 1;
+  }
 
   if (isMod(vk)) {
     kPhys[vk] = down;
@@ -1375,7 +1384,7 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);      // pointer speed
   AppendMenuW(menu, MF_STRING, ID_RELEARN, L"Relearn pointer speed");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-  AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug mode (save log to desktop)" : L"Start debug mode");
+  AppendMenuW(menu, MF_STRING, ID_DEBUG, gDebugOn ? L"Finish debug mode (Esc, saves log to desktop)" : L"Start debug mode");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit");
   SetForegroundWindow(gWnd);
@@ -1833,6 +1842,68 @@ static void toggleSetting(bool *value) {
   applyStartup();
 }
 
+// ---------------------------------------------------------------- dark title bars
+//
+// Windows of the apps in "darkTitleBarApps" get a dark title bar (white text and buttons)
+// in the "darkTitleBarColor" color, set from outside the app like Mica For Everyone does.
+// Windows reports each window as it's shown, so this costs nothing while none open.
+
+#define MAX_TB_APPS 32
+static wchar_t gTbApps[MAX_TB_APPS][64];  // program file names, like Plex.exe
+static int gTbAppCount;
+static COLORREF gTbColor = RGB(0x20, 0x20, 0x20);
+static HWINEVENTHOOK gTbHook;
+
+static bool tbWanted(HWND w) {
+  if (!gTbAppCount || GetAncestor(w, GA_ROOT) != w || !(GetWindowLongW(w, GWL_STYLE) & WS_CAPTION)) return false;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(w, &pid);
+  HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!p) return false;
+  wchar_t path[MAX_PATH];
+  DWORD n = MAX_PATH;
+  bool ok = QueryFullProcessImageNameW(p, 0, path, &n);
+  CloseHandle(p);
+  if (!ok) return false;
+  const wchar_t *name = wcsrchr(path, L'\\');
+  name = name ? name + 1 : path;
+  for (int i = 0; i < gTbAppCount; i++)
+    if (!_wcsicmp(name, gTbApps[i])) return true;
+  return false;
+}
+
+static void tbApply(HWND w) {
+  BOOL dark = TRUE;
+  if (FAILED(DwmSetWindowAttribute(w, 20, &dark, sizeof dark)))  // DWMWA_USE_IMMERSIVE_DARK_MODE
+    DwmSetWindowAttribute(w, 19, &dark, sizeof dark);              // its number before Windows 10 20H1
+  DwmSetWindowAttribute(w, 35, &gTbColor, sizeof gTbColor);        // DWMWA_CAPTION_COLOR (Windows 11)
+}
+
+static void CALLBACK tbEvent(HWINEVENTHOOK h, DWORD ev, HWND w, LONG obj, LONG child, DWORD thread, DWORD time) {
+  (void)h; (void)ev; (void)thread; (void)time;
+  if (w && obj == OBJID_WINDOW && child == CHILDID_SELF && tbWanted(w)) {
+    tbApply(w);
+    LOG("dark title bar: applied to a new window\n");
+  }
+}
+
+static BOOL CALLBACK tbEnum(HWND w, LPARAM lp) {
+  (void)lp;
+  if (IsWindowVisible(w) && tbWanted(w)) tbApply(w);
+  return TRUE;
+}
+
+// After loading settings: watch for windows only if there are apps, and update the
+// windows already open.
+static void titleBarsUpdate(void) {
+  if (!gWnd) return;  // not the running copy (installer, updater)
+  if (gTbAppCount && !gTbHook)
+    gTbHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL, tbEvent, 0, 0,
+                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+  if (!gTbAppCount && gTbHook) { UnhookWinEvent(gTbHook); gTbHook = NULL; }
+  if (gTbAppCount) EnumWindows(tbEnum, 0);
+}
+
 // ---------------------------------------------------------------- uninstall
 //
 // From Settings > Apps ("--uninstall"): asks first, then (with admin
@@ -2027,7 +2098,7 @@ static void debugStart(void) {
   LeaveCriticalSection(&gLogLock);
   logState();
   trayNotify(L"Macify debug mode started",
-             L"Reproduce the problem, then choose \"Finish debug mode\" in this menu to save the log to your desktop.");
+             L"Reproduce the problem, then press Esc (or choose \"Finish debug mode\" in this menu) to save the log to your desktop.");
 }
 
 static void debugFinish(void) {
@@ -2070,14 +2141,19 @@ static void debugFinish(void) {
 #define FOUND_REMAPS  8
 #define FOUND_UPDATES 16
 #define FOUND_JUMP    32
-#define FOUND_ALL     63
-#define FOUND_OBSOLETE 64  // a setting that no longer exists: rewrite the file without it
+#define FOUND_TBAPPS  64
+#define FOUND_TBCOLOR 128
+#define FOUND_ALL     255
+#define FOUND_OBSOLETE 1024  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
   bool runAtStartup, runAsAdmin, checkUpdates;
   double speed, jump;
   Remap remaps[MAX_REMAPS];
   int remapCount;
+  char tbApps[MAX_TB_APPS][64];
+  int tbAppCount;
+  COLORREF tbColor;
   char skipped[400];  // key remaps that couldn't be used, and why
   int found;          // which settings the file had: FOUND_* bits
 } Settings;
@@ -2265,10 +2341,20 @@ static bool yamlBool(const char *v, bool *out) {
   return false;
 }
 
+// Adds one darkTitleBarApps entry.
+static bool tbAddApp(Settings *st, const char *raw, int lineNo, char *err, size_t errLen) {
+  char name[64];
+  if (!yamlScalar(yamlTrim((char *)raw), name, sizeof name)) { snprintf(err, errLen, "a quote isn't closed on line %d", lineNo); return false; }
+  if (!*name) return true;
+  if (st->tbAppCount >= MAX_TB_APPS) { snprintf(err, errLen, "darkTitleBarApps can have at most %d apps (line %d)", MAX_TB_APPS, lineNo); return false; }
+  snprintf(st->tbApps[st->tbAppCount++], 64, "%s", name);
+  return true;
+}
+
 static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t errLen) {
   static char buf[8192];
   snprintf(buf, sizeof buf, "%s", text);
-  bool inRemaps = false;
+  bool inRemaps = false, inApps = false;
   int lineNo = 0;
   for (char *line = buf, *next; line; line = next) {
     next = strchr(line, '\n');
@@ -2279,6 +2365,16 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
     bool indented = line[0] == ' ' || line[0] == '\t';
     char *content = yamlTrim(line);
     if (!*content) continue;
+    if (content[0] == '-' && (content[1] == ' ' || content[1] == 0)) {  // a list entry
+      if (!inApps) { snprintf(err, errLen, "line %d is a list entry (- ...), but isn't under darkTitleBarApps", lineNo); return false; }
+      if (!tbAddApp(st, content + 1, lineNo, err, errLen)) return false;
+      continue;
+    }
+    // darkTitleBarColor: #202020 without quotes would be read as a comment
+    if (!strncmp(content, "darkTitleBarColor:", 18) && !*yamlTrim(content + 18)) {
+      snprintf(err, errLen, "darkTitleBarColor needs a color in quotes, like \"#202020\" (line %d)", lineNo);
+      return false;
+    }
 
     char *rawKey, *rawValue, key[64], value[64];
     if (!yamlSplit(content, &rawKey, &rawValue)) {
@@ -2302,8 +2398,35 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       continue;
     }
 
-    inRemaps = false;
-    if (!strcmp(key, "keyRemaps")) {
+    inRemaps = inApps = false;
+    if (!strcmp(key, "darkTitleBarApps")) {
+      st->found |= FOUND_TBAPPS;
+      st->tbAppCount = 0;
+      if (!*value) { inApps = true; continue; }
+      char list[256];  // [A.exe, B.exe] on one line
+      snprintf(list, sizeof list, "%s", rawValue);
+      size_t len = strlen(list);
+      if (list[0] != '[' || list[len - 1] != ']') {
+        snprintf(err, errLen, "darkTitleBarApps (line %d) should be followed by indented lines like  - Plex.exe, or be []", lineNo);
+        return false;
+      }
+      list[len - 1] = 0;
+      for (char *item = list + 1, *comma; item; item = comma) {
+        comma = strchr(item, ',');
+        if (comma) *comma++ = 0;
+        if (!tbAddApp(st, item, lineNo, err, errLen)) return false;
+      }
+    } else if (!strcmp(key, "darkTitleBarColor")) {
+      const char *hex = value[0] == '#' ? value + 1 : value;
+      char *end;
+      unsigned long rgb = strtoul(hex, &end, 16);
+      if (strlen(hex) != 6 || *end) {
+        snprintf(err, errLen, "darkTitleBarColor must be a color like \"#202020\", with the quotes (line %d)", lineNo);
+        return false;
+      }
+      st->tbColor = RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+      st->found |= FOUND_TBCOLOR;
+    } else if (!strcmp(key, "keyRemaps")) {
       if (*value && strcmp(rawValue, "{}") != 0) {
         snprintf(err, errLen, "keyRemaps (line %d) should be followed by indented lines like  Ctrl+D: Delete", lineNo);
         return false;
@@ -2361,6 +2484,15 @@ static const char kHelpJump[] =
   "# between two touchpad reports is held back until it's clear whether it was real. It never\n"
   "# limits how fast you can drag. 0 (the default) turns this off. If your cursor jumps when\n"
   "# you start a drag fast, try 3.\n";
+static const char kHelpTbApps[] =
+  "# Apps whose title bar is made dark, with white text and buttons. One indented line each\n"
+  "# with the app's program file name (see Task Manager > Details), like:\n"
+  "#   darkTitleBarApps:\n"
+  "#     - Plex.exe\n"
+  "# [] means none.\n";
+static const char kHelpTbColor[] =
+  "# Background color of those title bars, as \"#RRGGBB\" with the quotes. Windows 11 only:\n"
+  "# Windows 10 uses its own dark color.\n";
 static const char kHelpRemaps[] =
   "# Key remaps, one indented line each:  keys you press: keys sent instead\n"
   "#   Write keys as modifiers joined with +, then one key: Ctrl+Shift+7\n"
@@ -2394,6 +2526,17 @@ static void markOwnWrite(const wchar_t *path) {
   if (GetFileAttributesExW(path, GetFileExInfoStandard, &a)) gSettingsTime = a.ftLastWriteTime;
 }
 
+static void tbPutApps(FILE *f) {
+  fputs(gTbAppCount ? "darkTitleBarApps:\n" : "darkTitleBarApps: []\n", f);
+  for (int i = 0; i < gTbAppCount; i++) {
+    char name[64];
+    snprintf(name, sizeof name, "%ls", gTbApps[i]);
+    fputs("  - ", f);
+    yamlPut(f, name);
+    fputc('\n', f);
+  }
+}
+
 // Writes all current settings to settings.yaml, with the explanation at the top. Used to
 // create the file and to bring a file from an older version up to date.
 static void settingsWrite(void) {
@@ -2408,7 +2551,10 @@ static void settingsWrite(void) {
   fprintf(f, "%s\n%srunAtStartup: %s\n\n%srunAsAdministrator: %s\n\n%scheckForUpdatesOnStart: %s\n\n"
              "%sthreeFingerDragSpeed: %s\n\n%sthreeFingerDragJumpThreshold: %s\n\n%s",
           kHelpTop, kHelpStartup, gRunAtStartup ? "true" : "false", kHelpAdmin, gRunAsAdmin ? "true" : "false",
-          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpJump, jump, kHelpRemaps);
+          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpJump, jump, kHelpTbApps);
+  tbPutApps(f);
+  fprintf(f, "\n%sdarkTitleBarColor: \"#%02X%02X%02X\"\n\n%s", kHelpTbColor,
+          GetRValue(gTbColor), GetGValue(gTbColor), GetBValue(gTbColor), kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
   fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
@@ -2494,17 +2640,32 @@ static void settingsApply(Settings *st, bool userEdit) {
   gSpeedMul = st->speed;
   gJumpMm = st->jump;
   setRemaps(st->remaps, st->remapCount);
+  bool tbChanged = st->tbColor != gTbColor || st->tbAppCount != gTbAppCount;
+  for (int i = 0; i < st->tbAppCount; i++) {
+    wchar_t name[64];
+    _snwprintf(name, 64, L"%hs", st->tbApps[i]);
+    if (i >= gTbAppCount || wcscmp(name, gTbApps[i])) tbChanged = true;
+    wcscpy(gTbApps[i], name);
+  }
+  gTbAppCount = st->tbAppCount;
+  gTbColor = st->tbColor;
+  titleBarsUpdate();
   LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, threeFingerDragSpeed %.2f, "
-      "threeFingerDragJumpThreshold %.1f, %d key remaps\n", gRunAtStartup, gRunAsAdmin, gCheckUpdates, gSpeedMul, gJumpMm, gRemapCount);
+      "threeFingerDragJumpThreshold %.1f, %d dark title bar apps, %d key remaps\n", gRunAtStartup, gRunAsAdmin, gCheckUpdates,
+      gSpeedMul, gJumpMm, gTbAppCount, gRemapCount);
   if (st->skipped[0]) LOG("settings: skipped %s\n", st->skipped);
   // From an older version: add missing settings (and the explanation), drop removed ones.
   // Settings added since: insert just those, keeping the user's file (and comments) as is.
   int missing = FOUND_ALL & ~st->found;
-  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP))) {
+  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBAPPS | FOUND_TBCOLOR))) {
     if (missing & FOUND_UPDATES)
       settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Multiplies the three-finger drag speed");
     if (missing & FOUND_JUMP)
       settingsInsertLine(kHelpJump, "threeFingerDragJumpThreshold: 0", "# Key remaps");
+    if (missing & FOUND_TBAPPS)
+      settingsInsertLine(kHelpTbApps, "darkTitleBarApps: []", (st->found & FOUND_TBCOLOR) ? "# Background color of those" : "# Key remaps");
+    if (missing & FOUND_TBCOLOR)
+      settingsInsertLine(kHelpTbColor, "darkTitleBarColor: \"#202020\"", "# Key remaps");
   } else if (st->found != FOUND_ALL) {
     settingsWrite();
   }
@@ -2512,10 +2673,10 @@ static void settingsApply(Settings *st, bool userEdit) {
   if (st->skipped[0]) {
     _snwprintf(gSettingsError, 256, L"Skipped %hs. The other settings are applied.", st->skipped);
     if (gWnd) { trayNotify(L"Some key remaps were skipped", gSettingsError); gSettingsError[0] = 0; }
-  } else if (userEdit && (dragChanged || remapsChanged)) {
-    wchar_t msg[160];
-    _snwprintf(msg, 160, L"%d key remaps active. Drag speed %.2fx, jump threshold %g mm%ls.", gRemapCount, gSpeedMul,
-               gJumpMm, gJumpMm <= 0 ? L" (off)" : L"");
+  } else if (userEdit && (dragChanged || remapsChanged || tbChanged)) {
+    wchar_t msg[200];
+    _snwprintf(msg, 200, L"%d key remaps active. Drag speed %.2fx, jump threshold %g mm%ls. Dark title bars for %d apps.",
+               gRemapCount, gSpeedMul, gJumpMm, gJumpMm <= 0 ? L" (off)" : L"", gTbAppCount);
     trayNotify(L"Macify settings applied", msg);
   }
   if (userEdit && startupChanged && gWnd) applyStartup();
@@ -2526,6 +2687,7 @@ static void settingsDefaults(Settings *st) {
   st->runAtStartup = st->runAsAdmin = st->checkUpdates = true;  // for anything the file leaves out
   st->speed = 1.0;
   st->jump = 0;  // off: only some touchpads need it
+  st->tbColor = RGB(0x20, 0x20, 0x20);
 }
 
 static size_t readSmallFile(const wchar_t *path, char *text, size_t size) {
@@ -2897,6 +3059,9 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
       break;
     case WM_UPDATE_RESULT:
       updateResult((UpdateResult *)lp);
+      return 0;
+    case WM_DEBUG_ESCAPE:
+      if (gDebugOn) debugFinish();
       return 0;
     case WM_CANCEL_DRAG:
       if (gReleasePending) { LOG("cursor moved during grace period\n"); endDrag(); }

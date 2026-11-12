@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")"
 CC=x86_64-w64-mingw32-gcc
 FLAGS='-O2 -s -static -municode -Wall -Wextra'
-LIBS='-lhid -luser32 -lshell32 -lgdi32 -ladvapi32 -lole32 -luuid -lwinhttp -lshlwapi'
+LIBS='-lhid -luser32 -lshell32 -lgdi32 -ladvapi32 -lole32 -luuid -lwinhttp -lshlwapi -ldwmapi'
 x86_64-w64-mingw32-windres app.rc -O coff -o app-res.o
 $CC $FLAGS -mwindows macify.c app-res.o -o macify.exe $LIBS
 rm -f app-res.o
