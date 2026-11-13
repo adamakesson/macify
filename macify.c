@@ -3226,6 +3226,8 @@ static int run(void) {
 
   curveLoad();
   settingsLoad(false);
+  titleBarsUpdate();  // the first settingsLoad ran before there was a window, and this one
+                      // skips the unchanged file: title bars wouldn't be colored until an edit
   settingsWatchStart();
   SetTimer(gWnd, TIMER_SAVE, SAVE_INTERVAL_MS, NULL);
   gIcon = makeIcon();
