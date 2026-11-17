@@ -58,7 +58,7 @@ This is always on and can't be changed in the settings file.
 
 ## Key remaps
 
-Shortcuts that send other keys instead. These are the defaults:
+Shortcuts that send other keys instead. These are the defaults, for every keyboard layout:
 
 | Keys | Result |
 |---|---|
@@ -67,8 +67,13 @@ Shortcuts that send other keys instead. These are the defaults:
 | Ctrl+Shift+3 | Win+PrintScreen (screenshot, saved to Pictures) |
 | Ctrl+Shift+4 | Win+Shift+S (snip part of the screen) |
 | Ctrl+I | Ctrl+Shift+C |
-| Alt+1, 2, 3, 4, 7, 8, 9, 0, `+` | The AltGr character on that key (such as `@ £ $ { [ ] } \` on a Swedish layout) |
-| Alt+`<` | `\|` (AltGr+`<`) |
+
+And only with the Swedish layout (`sv-SE`), where they type the AltGr character on that key:
+
+| Keys | Result |
+|---|---|
+| Alt+1, 2, 3, 4, 7, 8, 9, 0, `+` | `@ £ $ { [ ] } \` |
+| Alt+`<` | `\|` |
 
 "Ctrl" includes the left Windows key. A remap only fires with exactly those modifiers
 held, the way AutoHotkey hotkeys do: Ctrl+D doesn't fire for Ctrl+Shift+D. Modifiers that
@@ -96,7 +101,30 @@ keyRemaps:
   `Alt+W` is reserved for the Windows key. `Alt` is the plain Alt key: AltGr always keeps
   typing its characters, even when Alt with the same key is remapped.
 - An entry with a mistake is skipped, with a notification saying why; the others still
-  work. Remove `keyRemaps` to get the defaults back; `keyRemaps: {}` turns them all off.
+  work. `keyRemaps: {}` turns them all off.
+
+### For one keyboard layout
+
+Remaps under `keyRemapsForLayout` are used only while that keyboard layout is active
+(Win+Space switches layouts):
+
+```yaml
+keyRemapsForLayout:
+  sv-SE:
+    Alt+1: Ctrl+Alt+1
+    Alt+<: Ctrl+Alt+<
+  en-US:
+    Alt+3: Ctrl+Alt+3
+```
+
+- Each layout is written as its language tag: `sv-SE`, `en-US`, `de-DE`, `nb-NO`, …
+  The [debug log](#debug-mode) shows the current one.
+- For the same keys, a layout's remap replaces the one in `keyRemaps`; other keys still use
+  `keyRemaps`.
+- Characters like `<` are the keys that type them on that layout.
+- `keyRemapsForLayout: {}` means none. Delete both `keyRemaps` and `keyRemapsForLayout` to
+  get all the default remaps back. (A settings file from before 1.27 gets
+  `keyRemapsForLayout: {}`, so its own `keyRemaps` keep working as before.)
 
 ## Ctrl+click and Alt+click
 
@@ -143,17 +171,22 @@ Built for Windows 10/11 with a Precision Touchpad.
 Tray icon → **Edit settings** opens `%APPDATA%\Macify\settings.yaml`. Changes apply as
 soon as you save; a notification confirms them, or says what's wrong with the file. The
 startup and update options can also be switched from the tray menu, which updates the file.
+**Reset settings…** puts every setting back to its default, after asking (the learned
+pointer speed is kept).
 
 ```yaml
 runAtStartup: true
 runAsAdministrator: true
 checkForUpdatesOnStart: true
-threeFingerDragSpeed: 1.0
 threeFingerDragJumpThreshold: 0
 titleBarColors: {}
 keyRemaps:
   Ctrl+D: Delete
   # ... the other key remaps
+keyRemapsForLayout:
+  sv-SE:
+    Alt+1: Ctrl+Alt+1
+    # ...
 ```
 
 The file starts with a comment explaining every setting. (Versions up to 1.8 used
@@ -164,10 +197,10 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `runAtStartup` | Start Macify when you log in |
 | `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
 | `checkForUpdatesOnStart` | Shortly after Macify starts, check here for a newer version. If there is one, it's downloaded in the background and a notification offers it: click it, or choose **Install Macify …** in the tray menu. Silent when there's nothing new |
-| `threeFingerDragSpeed` | Multiplies the three-finger drag speed: `1.0` matches the normal pointer, `1.5` is 50 % faster |
 | `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` (the default) turns it off; if your cursor jumps when you start a drag fast, try `3` |
 | `titleBarColors` | Apps whose title bar gets a color, see [Title bar colors](#title-bar-colors). `{}` (the default) means none |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
+| `keyRemapsForLayout` | Key remaps for one keyboard layout, see [For one keyboard layout](#for-one-keyboard-layout) |
 
 ## Debug mode
 
@@ -175,7 +208,8 @@ Tray icon → **Start debug mode**, reproduce the problem, then press **Esc** (o
 **Finish debug mode**): a `Macify debug log <date>.txt` appears on the desktop. While debug
 mode is on, Esc only finishes it and isn't passed on to apps. It starts with the app's state
 (Windows version, touchpad details, learned speed curve) followed by events: drags,
-filtered touchpad artefacts, cursor lag, learning, and remapped shortcuts and clicks.
+filtered touchpad artefacts, cursor lag, learning, remapped shortcuts and clicks, and the
+keyboard layout's language tag whenever you type with a different layout.
 It never records what you type. Logging costs nothing while off.
 
 ## Updating

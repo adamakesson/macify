@@ -51,7 +51,6 @@
 //                                       windows) via a scheduled task, without prompts
 //   "checkForUpdatesOnStart": true      shortly after starting, check GitHub for a newer
 //                                       version and offer it in a notification
-//   "threeFingerDragSpeed": 1.0         multiplies the three-finger drag speed
 //
 // Pointer speed is learned, not configured: while you use one finger normally, the app
 // compares how far (and how fast) your finger moved with how far Windows moved the
@@ -139,6 +138,7 @@
 #define ID_SETTINGS 104
 #define ID_UPDATE 105
 #define ID_AUTOUPDATE 107
+#define ID_RESET 108
 #define UNINSTALL_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Macify"
 #define WM_UPDATE_RESULT (WM_APP + 5)
 #define WM_DEBUG_ESCAPE (WM_APP + 6)
@@ -157,11 +157,13 @@
 // Debug log: off unless switched on from the tray menu; then lines are collected in
 // memory and saved to the desktop on "Finish debug mode". Costs one check while off.
 static volatile bool gDebugOn;
+static LANGID gLoggedLang;  // the keyboard layout last written to the debug log
 static void debugLog(const char *fmt, ...);
 #define LOG(...) do { if (gDebugOn) debugLog(__VA_ARGS__); } while (0)
 static void debugStart(void);
 static void debugFinish(void);
 static void settingsEdit(void);
+static void settingsReset(void);
 static void settingsLoad(bool userEdit);
 static void settingsWrite(void);
 static void settingsSetBool(const char *name, bool value);
@@ -231,7 +233,6 @@ static double gSettleUntilMs;
 static bool gRunAtStartup = true;  // settings.yaml: runAtStartup
 static bool gRunAsAdmin = true;    // settings.yaml: runAsAdministrator
 static bool gCheckUpdates = true;  // settings.yaml: checkForUpdatesOnStart
-static double gSpeedMul = 1.0;     // settings.yaml: threeFingerDragSpeed
 static double gJumpMm = 0;         // settings.yaml: threeFingerDragJumpThreshold (0: no filter)
 static int gLastScan = -1;
 static bool gVelValid, gHolding;
@@ -542,7 +543,7 @@ static void moveCursor(double dxMm, double dyMm, double dtMs) {
   double inst = dist / (dtMs / 1000.0);
   gDragSpeed += (inst - gDragSpeed) * (1.0 - exp(-dtMs / SPEED_SMOOTH_MS));
   if (dist <= 0) return;
-  double gain = gainAt(gDragSpeed) * gSpeedMul;
+  double gain = gainAt(gDragSpeed);
 
   gCurX += dxMm * gain;
   gCurY += dyMm * gain;
@@ -878,7 +879,7 @@ static void onRawInput(HRAWINPUT h) {
 #define KM_ALT   2
 #define KM_SHIFT 4
 #define KM_WIN   8
-#define MAX_REMAPS 64
+#define MAX_REMAPS 128
 
 typedef struct {
   BYTE mods;
@@ -889,6 +890,8 @@ typedef struct {
 typedef struct {
   KeySpec from, to;
   char fromText[48], toText[48];  // as written in the file
+  LANGID lang;                    // keyRemapsForLayout: only while this layout is active (0: any)
+  char layout[16];                // its language tag as written, like sv-SE
 } Remap;
 
 static Remap gRemaps[MAX_REMAPS];
@@ -900,6 +903,11 @@ static const char *const kDefaultRemaps[][2] = {
   { "Ctrl+D", "Delete" },           { "Ctrl+Backspace", "Delete" },
   { "Ctrl+Shift+3", "Win+PrintScreen" }, { "Ctrl+Shift+4", "Win+Shift+S" },
   { "Ctrl+I", "Ctrl+Shift+C" },
+};
+
+// Defaults for one layout: the AltGr characters on a Swedish keyboard, on Alt.
+#define DEFAULT_LAYOUT "sv-SE"
+static const char *const kDefaultLayoutRemaps[][2] = {
   { "Alt+1", "Ctrl+Alt+1" },        { "Alt+2", "Ctrl+Alt+2" },        { "Alt+3", "Ctrl+Alt+3" },
   { "Alt+4", "Ctrl+Alt+4" },        { "Alt+7", "Ctrl+Alt+7" },        { "Alt+8", "Ctrl+Alt+8" },
   { "Alt+9", "Ctrl+Alt+9" },        { "Alt+0", "Ctrl+Alt+0" },        { "Alt++", "Ctrl+Alt++" },
@@ -964,9 +972,20 @@ static bool parseKeySpec(const char *text, KeySpec *k, char *why, size_t whyLen)
 
 // One "keys you press": "keys sent instead" entry, checked. Adds it (replacing an entry
 // for the same keys) or explains why not.
-static bool addRemap(Remap *list, int *count, const char *from, const char *to, char *why, size_t whyLen) {
+// A language tag like sv-SE as a LANGID, or 0 if Windows doesn't know it.
+static LANGID tagToLang(const char *tag) {
+  wchar_t w[LOCALE_NAME_MAX_LENGTH];
+  if (!MultiByteToWideChar(CP_UTF8, 0, tag, -1, w, LOCALE_NAME_MAX_LENGTH)) return 0;
+  LCID lcid = LocaleNameToLCID(w, 0);
+  return lcid && lcid != LOCALE_CUSTOM_UNSPECIFIED ? LANGIDFROMLCID(lcid) : 0;
+}
+
+static bool addRemap(Remap *list, int *count, const char *from, const char *to, LANGID lang, const char *layout,
+                     char *why, size_t whyLen) {
   Remap r;
   memset(&r, 0, sizeof r);
+  r.lang = lang;
+  snprintf(r.layout, sizeof r.layout, "%s", lang ? layout : "");
   char reason[120];
   if (!parseKeySpec(from, &r.from, reason, sizeof reason)) { snprintf(why, whyLen, "\"%s\": %s", from, reason); return false; }
   if (!parseKeySpec(to, &r.to, reason, sizeof reason)) { snprintf(why, whyLen, "\"%s\": %s", to, reason); return false; }
@@ -981,7 +1000,8 @@ static bool addRemap(Remap *list, int *count, const char *from, const char *to, 
   snprintf(r.fromText, sizeof r.fromText, "%s", from);
   snprintf(r.toText, sizeof r.toText, "%s", to);
   for (int i = 0; i < *count; i++)
-    if (list[i].from.mods == r.from.mods && list[i].from.vk == r.from.vk && list[i].from.ch == r.from.ch) {
+    if (list[i].lang == r.lang && list[i].from.mods == r.from.mods && list[i].from.vk == r.from.vk &&
+        list[i].from.ch == r.from.ch) {
       list[i] = r;
       return true;
     }
@@ -990,11 +1010,25 @@ static bool addRemap(Remap *list, int *count, const char *from, const char *to, 
   return true;
 }
 
-static void defaultRemaps(Remap *list, int *count) {
+// Removes the remaps for all layouts (layout == false) or the layout-specific ones.
+static void dropRemaps(Remap *list, int *count, bool layout) {
+  int n = 0;
+  for (int i = 0; i < *count; i++)
+    if ((list[i].lang != 0) != layout) list[n++] = list[i];
+  *count = n;
+}
+
+// The default keyRemaps (general: true) or keyRemapsForLayout (general: false), added
+// to what the list already has.
+static void defaultRemaps(Remap *list, int *count, bool general) {
   char why[160];
-  *count = 0;
-  for (size_t i = 0; i < sizeof kDefaultRemaps / sizeof *kDefaultRemaps; i++)
-    addRemap(list, count, kDefaultRemaps[i][0], kDefaultRemaps[i][1], why, sizeof why);
+  if (general)
+    for (size_t i = 0; i < sizeof kDefaultRemaps / sizeof *kDefaultRemaps; i++)
+      addRemap(list, count, kDefaultRemaps[i][0], kDefaultRemaps[i][1], 0, NULL, why, sizeof why);
+  else
+    for (size_t i = 0; i < sizeof kDefaultLayoutRemaps / sizeof *kDefaultLayoutRemaps; i++)
+      addRemap(list, count, kDefaultLayoutRemaps[i][0], kDefaultLayoutRemaps[i][1], tagToLang(DEFAULT_LAYOUT),
+               DEFAULT_LAYOUT, why, sizeof why);
 }
 
 static void setRemaps(const Remap *list, int count) {
@@ -1133,16 +1167,25 @@ static bool runHotkey(UINT vk) {
   if (mods & KM_WIN) return false;
   KeySpec out;
   bool found = false;
-  AcquireSRWLockShared(&gRemapLock);
-  for (int i = 0; i < gRemapCount && !found; i++) {
-    const Remap *r = &gRemaps[i];
-    if (r->from.mods != mods) continue;
-    UINT fromVk = r->from.vk ? r->from.vk : charVk(r->from.ch, 0);
-    if (!fromVk || fromVk != vk) continue;
-    out = r->to;
-    found = true;
-    LOG("remap %s -> %s\n", r->fromText, r->toText);
+  // The current layout's remaps first, then those for every layout.
+  LANGID lang = LOWORD((ULONG_PTR)GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL)));
+  if (gDebugOn && lang != gLoggedLang) {  // shows the tag to use in keyRemapsForLayout
+    gLoggedLang = lang;
+    wchar_t tag[LOCALE_NAME_MAX_LENGTH] = L"?";
+    LCIDToLocaleName(MAKELCID(lang, SORT_DEFAULT), tag, LOCALE_NAME_MAX_LENGTH, 0);
+    LOG("keyboard layout: %ls\n", tag);
   }
+  AcquireSRWLockShared(&gRemapLock);
+  for (int pass = 0; pass < 2 && !found; pass++)
+    for (int i = 0; i < gRemapCount && !found; i++) {
+      const Remap *r = &gRemaps[i];
+      if (r->lang != (pass == 0 ? lang : 0) || r->from.mods != mods) continue;
+      UINT fromVk = r->from.vk ? r->from.vk : charVk(r->from.ch, 0);
+      if (!fromVk || fromVk != vk) continue;
+      out = r->to;
+      found = true;
+      LOG("remap %s -> %s%s%s\n", r->fromText, r->toText, r->lang ? ", for " : "", r->layout);
+    }
   ReleaseSRWLockShared(&gRemapLock);
   if (!found) return false;
   UINT outVk = out.vk ? out.vk : charVk(out.ch, 0);
@@ -1375,6 +1418,7 @@ static void showTrayMenu(void) {
   AppendMenuW(menu, MF_STRING | (gCheckUpdates ? MF_CHECKED : 0), ID_AUTOUPDATE, L"Check for updates on start");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
   AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"Edit settings");
+  AppendMenuW(menu, MF_STRING, ID_RESET, L"Reset settings...");
   AppendMenuW(menu, MF_STRING | (gUpdateBusy ? MF_GRAYED : 0), ID_UPDATE,
               gPendingTag[0] ? install : gUpdateBusy ? L"Checking for updates..." : L"Check for updates");
   AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -1396,6 +1440,7 @@ static void showTrayMenu(void) {
     settingsSetBool("checkForUpdatesOnStart", gCheckUpdates);
   }
   if (cmd == ID_SETTINGS) settingsEdit();
+  if (cmd == ID_RESET) settingsReset();
   if (cmd == ID_UPDATE) { if (gPendingTag[0]) updateInstallPending(); else updateCheck(false); }
   if (cmd == ID_DEBUG) { if (gDebugOn) debugFinish(); else debugStart(); }
   if (cmd == ID_QUIT) quit();
@@ -2060,6 +2105,12 @@ static void logState(void) {
   logRegString("Windows", L"ProductName");
   logRegString("Windows version", L"DisplayVersion");
   logRegString("Windows build", L"CurrentBuild");
+  {
+    HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+    wchar_t tag[LOCALE_NAME_MAX_LENGTH] = L"?";
+    LCIDToLocaleName(MAKELCID(LOWORD((ULONG_PTR)hkl), SORT_DEFAULT), tag, LOCALE_NAME_MAX_LENGTH, 0);
+    LOG("keyboard layout: %ls (layout id %08lX); logged again whenever it changes\n", tag, (unsigned long)(ULONG_PTR)hkl);
+  }
   LOG("check for updates on start: %s\n", gCheckUpdates ? "on" : "off");
   LOG("admin rights: %s, installed copy: %s, run at startup: %s\n", isElevated() ? "yes" : "no",
       isInstalledCopy() ? "yes" : "no", gRunAtStartup ? "on" : "off");
@@ -2083,10 +2134,10 @@ static void logState(void) {
   for (int b = 0; b < LEARN_BINS; b++)
     if (gBinMm[b] > 0)
       LOG("  %6.1f mm/s: %6.2f px/mm from %.0f mm of movement\n", binSpeed(b), gBinPx[b] / gBinMm[b], gBinMm[b]);
-  LOG("settings: runAtStartup %d, runAsAdministrator %d, threeFingerDragSpeed %.2f\n",
-      gRunAtStartup, gRunAsAdmin, gSpeedMul);
+  LOG("settings: runAtStartup %d, runAsAdministrator %d\n", gRunAtStartup, gRunAsAdmin);
   AcquireSRWLockShared(&gRemapLock);
-  for (int i = 0; i < gRemapCount; i++) LOG("  remap %s -> %s\n", gRemaps[i].fromText, gRemaps[i].toText);
+  for (int i = 0; i < gRemapCount; i++)
+    LOG("  remap %s -> %s%s%s\n", gRemaps[i].fromText, gRemaps[i].toText, gRemaps[i].lang ? ", for " : "", gRemaps[i].layout);
   ReleaseSRWLockShared(&gRemapLock);
   LOG("--- events ---\n");
 }
@@ -2099,6 +2150,7 @@ static void debugStart(void) {
   gLogFull = false;
   QueryPerformanceCounter(&gLogStart);
   gDebugOn = true;
+  gLoggedLang = 0;
   LeaveCriticalSection(&gLogLock);
   logState();
   trayNotify(L"Macify debug mode started",
@@ -2141,17 +2193,19 @@ static void debugFinish(void) {
 
 #define FOUND_STARTUP 1
 #define FOUND_ADMIN   2
-#define FOUND_SPEED   4
+#define FOUND_SPEED   2048  // threeFingerDragSpeed, removed in 1.27: taken out of the file
 #define FOUND_REMAPS  8
+#define FOUND_FREE    4     // (was threeFingerDragSpeed)
 #define FOUND_UPDATES 16
 #define FOUND_JUMP    32
 #define FOUND_TBCOLORS 64
-#define FOUND_ALL     127
+#define FOUND_LAYOUTS 128
+#define FOUND_ALL     (255 & ~FOUND_FREE)
 #define FOUND_OBSOLETE 1024  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
   bool runAtStartup, runAsAdmin, checkUpdates;
-  double speed, jump;
+  double jump;
   Remap remaps[MAX_REMAPS];
   int remapCount;
   char tbApps[MAX_TB_APPS][64];
@@ -2239,13 +2293,12 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
         snprintf(err, errLen, "\"%s\" must be a number above 0, like 1.0 or 1.5 (line %d)", key, line);
         return false;
       }
-      st->speed = v;
       st->found |= FOUND_SPEED;
       j.p = end;
     } else if (strcmp(key, "keyRemaps") == 0) {
       if (*j.p != '{') { snprintf(err, errLen, "\"keyRemaps\" must be { ... } (line %d)", line); return false; }
       j.p++;
-      st->remapCount = 0;
+      dropRemaps(st->remaps, &st->remapCount, false);
       st->found |= FOUND_REMAPS;
       for (;;) {
         jsonSkip(&j);
@@ -2258,7 +2311,7 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
         j.p++;
         jsonSkip(&j);
         if (!jsonString(&j, to, sizeof to)) { snprintf(err, errLen, "\"%s\" needs \"keys\" to send (line %d)", from, entryLine); return false; }
-        if (!addRemap(st->remaps, &st->remapCount, from, to, why, sizeof why)) {
+        if (!addRemap(st->remaps, &st->remapCount, from, to, 0, NULL, why, sizeof why)) {
           size_t used = strlen(st->skipped);
           snprintf(st->skipped + used, sizeof st->skipped - used, "%s%s (line %d)", used ? "; " : "", why, entryLine);
         }
@@ -2379,7 +2432,9 @@ static bool tbAddEntry(Settings *st, const char *app, const char *color, int lin
 static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t errLen) {
   static char buf[8192];
   snprintf(buf, sizeof buf, "%s", text);
-  bool inRemaps = false, inColors = false, inOldApps = false;
+  bool inRemaps = false, inColors = false, inOldApps = false, inLayouts = false;
+  char layout[64] = "";  // the layout being read in keyRemapsForLayout
+  LANGID layoutLang = 0;
   int lineNo = 0;
   for (char *line = buf, *next; line; line = next) {
     next = strchr(line, '\n');
@@ -2415,18 +2470,33 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       if (!tbAddEntry(st, key, value, lineNo, err, errLen)) return false;
       continue;
     }
-    if (indented) {  // an entry under keyRemaps
-      if (!inRemaps) { snprintf(err, errLen, "line %d is indented, but isn't under keyRemaps", lineNo); return false; }
+    if (indented && inLayouts && (!*value || !strcmp(rawValue, "{}"))) {  // a layout: "sv-SE:"
+      snprintf(layout, sizeof layout, "%s", key);
+      layoutLang = tagToLang(key);
+      if (!layoutLang) {
+        size_t used = strlen(st->skipped);
+        snprintf(st->skipped + used, sizeof st->skipped - used, "%s\"%s\": not a language tag like sv-SE (line %d)",
+                 used ? "; " : "", key, lineNo);
+      }
+      continue;
+    }
+    if (indented) {  // an entry under keyRemaps or a layout
+      if (!inRemaps && !inLayouts) { snprintf(err, errLen, "line %d is indented, but isn't under keyRemaps", lineNo); return false; }
+      if (inLayouts && !layout[0]) {
+        snprintf(err, errLen, "line %d: remaps in keyRemapsForLayout go under a layout, like  sv-SE:", lineNo);
+        return false;
+      }
+      if (inLayouts && !layoutLang) continue;  // unknown layout: already reported
       char why[160];
       if (!*value) snprintf(why, sizeof why, "\"%s\": no keys to send", key);
-      if (!*value || !addRemap(st->remaps, &st->remapCount, key, value, why, sizeof why)) {
+      if (!*value || !addRemap(st->remaps, &st->remapCount, key, value, inLayouts ? layoutLang : 0, layout, why, sizeof why)) {
         size_t used = strlen(st->skipped);
         snprintf(st->skipped + used, sizeof st->skipped - used, "%s%s (line %d)", used ? "; " : "", why, lineNo);
       }
       continue;
     }
 
-    inRemaps = inColors = inOldApps = false;
+    inRemaps = inColors = inOldApps = inLayouts = false;
     if (!strcmp(key, "titleBarColors")) {
       if (*value && strcmp(rawValue, "{}") != 0) {
         snprintf(err, errLen, "titleBarColors (line %d) should be followed by indented lines like  Plex.exe: \"#202020\"", lineNo);
@@ -2459,8 +2529,17 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
         return false;
       }
       st->found |= FOUND_REMAPS;
-      st->remapCount = 0;
+      dropRemaps(st->remaps, &st->remapCount, false);
       inRemaps = !*value;
+    } else if (!strcmp(key, "keyRemapsForLayout")) {
+      if (*value && strcmp(rawValue, "{}") != 0) {
+        snprintf(err, errLen, "keyRemapsForLayout (line %d) should be followed by indented layouts like  sv-SE:", lineNo);
+        return false;
+      }
+      st->found |= FOUND_LAYOUTS;
+      dropRemaps(st->remaps, &st->remapCount, true);
+      inLayouts = !*value;
+      layout[0] = 0;
     } else if (!strcmp(key, "checkForUpdatesOnStart")) {
       if (!yamlBool(value, &st->checkUpdates)) { snprintf(err, errLen, "%s must be true or false (line %d)", key, lineNo); return false; }
       st->found |= FOUND_UPDATES;
@@ -2468,14 +2547,7 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       bool *flag = !strcmp(key, "runAtStartup") ? &st->runAtStartup : &st->runAsAdmin;
       if (!yamlBool(value, flag)) { snprintf(err, errLen, "%s must be true or false (line %d)", key, lineNo); return false; }
       st->found |= flag == &st->runAtStartup ? FOUND_STARTUP : FOUND_ADMIN;
-    } else if (!strcmp(key, "threeFingerDragSpeed")) {
-      char *end;
-      double v = strtod(value, &end);
-      if (end == value || *end || !(v > 0) || v > 20) {
-        snprintf(err, errLen, "threeFingerDragSpeed must be a number above 0, like 1.0 or 1.5 (line %d)", lineNo);
-        return false;
-      }
-      st->speed = v;
+    } else if (!strcmp(key, "threeFingerDragSpeed")) {  // removed in 1.27
       st->found |= FOUND_SPEED;
     } else if (!strcmp(key, "threeFingerDragJumpThreshold")) {
       char *end;
@@ -2505,8 +2577,8 @@ static const char kHelpAdmin[] =
   "# Run with admin rights, so it also works in admin windows: true or false.\n";
 static const char kHelpUpdates[] =
   "# When Macify starts, check GitHub for a newer version and offer to install it: true or false.\n";
-static const char kHelpSpeed[] =
-  "# Multiplies the three-finger drag speed. 1.0 matches the normal pointer, 1.5 is 50% faster.\n";
+static const char kHelpSpeedOld[] =  // threeFingerDragSpeed, removed in 1.27
+  "# Multiplies the three-finger drag speed. 1.0 matches the normal pointer, 1.5 is 50% faster.";
 static const char kHelpJump[] =
   "# Some touchpads briefly report a much bigger movement than the real one, mostly when a\n"
   "# drag starts fast, which makes the cursor jump. A sudden change of more than this many mm\n"
@@ -2532,9 +2604,19 @@ static const char kHelpRemaps[] =
   "#   In the keys you press, Ctrl also means the left Windows key, and Win can't be used.\n"
   "#   Alt is the plain Alt key: AltGr always keeps typing its characters.\n"
   "#   A remap only happens with exactly those modifiers held: Ctrl+D isn't Ctrl+Shift+D.\n"
-  "#   Delete keyRemaps to get the default remaps back; keyRemaps: {} turns them all off.\n"
+  "#   Delete keyRemaps to get its default remaps back; keyRemaps: {} turns them all off.\n"
   "#   Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"
   "#   Windows key, and Ctrl+click or Alt+click is a right-click.\n";
+static const char kHelpLayouts[] =
+  "# Key remaps for one keyboard layout, used only while it's active (Win+Space switches).\n"
+  "# Each layout is its language tag, like sv-SE, en-US or de-DE (the debug log shows the\n"
+  "# current one), followed by its remaps, indented further and written as above. For the\n"
+  "# same keys, these replace the ones in keyRemaps. Like:\n"
+  "#   keyRemapsForLayout:\n"
+  "#     sv-SE:\n"
+  "#       Alt+1: Ctrl+Alt+1\n"
+  "# {} means none. Delete both keyRemaps and keyRemapsForLayout to get all the default\n"
+  "# remaps back.\n";
 
 // Writes a key or value, quoted only if YAML would otherwise misread it.
 static void yamlPut(FILE *f, const char *text) {
@@ -2570,26 +2652,45 @@ static void tbPutColors(FILE *f) {
 static void settingsWrite(void) {
   wchar_t path[MAX_PATH];
   if (!settingsPath(path)) return;
-  char speed[32];
-  snprintf(speed, sizeof speed, gSpeedMul == floor(gSpeedMul) ? "%.1f" : "%g", gSpeedMul);
   FILE *f = _wfopen(path, L"wb");
   if (!f) return;
   char jump[32];
   snprintf(jump, sizeof jump, gJumpMm == floor(gJumpMm) ? "%.0f" : "%g", gJumpMm);
   fprintf(f, "%s\n%srunAtStartup: %s\n\n%srunAsAdministrator: %s\n\n%scheckForUpdatesOnStart: %s\n\n"
-             "%sthreeFingerDragSpeed: %s\n\n%sthreeFingerDragJumpThreshold: %s\n\n%s",
+             "%sthreeFingerDragJumpThreshold: %s\n\n%s",
           kHelpTop, kHelpStartup, gRunAtStartup ? "true" : "false", kHelpAdmin, gRunAsAdmin ? "true" : "false",
-          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpSpeed, speed, kHelpJump, jump, kHelpTbColors);
+          kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpJump, jump, kHelpTbColors);
   tbPutColors(f);
   fprintf(f, "\n%s", kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
-  fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
+  int general = 0, layouts = 0;
+  for (int i = 0; i < gRemapCount; i++) { if (gRemaps[i].lang) layouts++; else general++; }
+  fputs(general ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
+    if (gRemaps[i].lang) continue;
     fputs("  ", f);
     yamlPut(f, gRemaps[i].fromText);
     fputs(": ", f);
     yamlPut(f, gRemaps[i].toText);
     fputc('\n', f);
+  }
+  fprintf(f, "\n%s%s", kHelpLayouts, layouts ? "keyRemapsForLayout:\n" : "keyRemapsForLayout: {}\n");
+  for (int i = 0; i < gRemapCount; i++) {  // grouped by layout, in the order they first appear
+    if (!gRemaps[i].lang) continue;
+    bool seen = false;
+    for (int j = 0; j < i && !seen; j++) seen = gRemaps[j].lang == gRemaps[i].lang;
+    if (seen) continue;
+    fputs("  ", f);
+    yamlPut(f, gRemaps[i].layout);
+    fputs(":\n", f);
+    for (int j = i; j < gRemapCount; j++) {
+      if (gRemaps[j].lang != gRemaps[i].lang) continue;
+      fputs("    ", f);
+      yamlPut(f, gRemaps[j].fromText);
+      fputs(": ", f);
+      yamlPut(f, gRemaps[j].toText);
+      fputc('\n', f);
+    }
   }
   ReleaseSRWLockShared(&gRemapLock);
   fclose(f);
@@ -2646,16 +2747,49 @@ static void settingsInsertLine(const char *help, const char *line, const char *b
     fwrite(text, 1, (size_t)(at - text), f);
     fprintf(f, "%s%s\n\n%s", help, line, at);
   } else {
-    fprintf(f, "%s%s\n%s%s\n", text, n && text[n - 1] != '\n' ? "\n" : "", help, line);
+    fprintf(f, "%s%s%s%s%s\n", text, n && text[n - 1] != '\n' ? "\n" : "", n ? "\n" : "", help, line);
   }
   fclose(f);
   markOwnWrite(path);
 }
 
+// Takes a removed setting out of the file without touching the rest: its line, the
+// explanation Macify wrote above it (if still there), and one blank line after it.
+static void settingsRemoveLine(const char *name, const char *help) {
+  wchar_t path[MAX_PATH];
+  if (!settingsPath(path)) return;
+  static char text[8192];
+  FILE *f = _wfopen(path, L"rb");
+  size_t n = f ? fread(text, 1, sizeof text - 1, f) : 0;
+  if (f) fclose(f);
+  text[n] = 0;
+  size_t nameLen = strlen(name);
+  char *prev = NULL;
+  for (char *l = text; l && *l; prev = l, l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL) {
+    if (strncmp(l, name, nameLen) || (l[nameLen] != ':' && l[nameLen] != ' ')) continue;
+    char *start = l, *end = strchr(l, '\n');
+    end = end ? end + 1 : l + strlen(l);
+    size_t helpLen = strlen(help);
+    if (prev && !strncmp(prev, help, helpLen) && (prev[helpLen] == '\n' || prev[helpLen] == '\r')) start = prev;
+    if (*end == '\n') end++;
+    else if (end[0] == '\r' && end[1] == '\n') end += 2;
+    f = _wfopen(path, L"wb");
+    if (!f) return;
+    fwrite(text, 1, (size_t)(start - text), f);
+    fputs(end, f);
+    fclose(f);
+    markOwnWrite(path);
+    return;
+  }
+}
+
 // Applies parsed settings. userEdit: the user saved the file, so confirm the changes.
 static void settingsApply(Settings *st, bool userEdit) {
-  if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount);
-  bool dragChanged = st->speed != gSpeedMul || st->jump != gJumpMm;
+  // Defaults for what the file leaves out. A file from before 1.27 has keyRemaps but no
+  // keyRemapsForLayout: its own remaps stay as they are, with no layout remaps added.
+  if (!(st->found & FOUND_LAYOUTS) && !(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount, false);
+  if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount, true);
+  bool dragChanged = st->jump != gJumpMm;
   bool startupChanged = st->runAtStartup != gRunAtStartup || st->runAsAdmin != gRunAsAdmin;
   AcquireSRWLockShared(&gRemapLock);
   bool remapsChanged = st->remapCount != gRemapCount ||
@@ -2664,7 +2798,6 @@ static void settingsApply(Settings *st, bool userEdit) {
   gRunAtStartup = st->runAtStartup;
   gRunAsAdmin = st->runAsAdmin;
   gCheckUpdates = st->checkUpdates;
-  gSpeedMul = st->speed;
   gJumpMm = st->jump;
   setRemaps(st->remaps, st->remapCount);
   bool tbChanged = st->tbAppCount != gTbAppCount;
@@ -2677,21 +2810,24 @@ static void settingsApply(Settings *st, bool userEdit) {
   }
   gTbAppCount = st->tbAppCount;
   titleBarsUpdate();
-  LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, threeFingerDragSpeed %.2f, "
+  LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, "
       "threeFingerDragJumpThreshold %.1f, %d title bar colors, %d key remaps\n", gRunAtStartup, gRunAsAdmin, gCheckUpdates,
-      gSpeedMul, gJumpMm, gTbAppCount, gRemapCount);
+      gJumpMm, gTbAppCount, gRemapCount);
   if (st->skipped[0]) LOG("settings: skipped %s\n", st->skipped);
   // From an older version: add missing settings (and the explanation), drop removed ones.
   // Settings added since: insert just those, keeping the user's file (and comments) as is.
+  if ((st->found & FOUND_SPEED) && !(st->found & FOUND_OBSOLETE)) settingsRemoveLine("threeFingerDragSpeed", kHelpSpeedOld);
   int missing = FOUND_ALL & ~st->found;
-  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBCOLORS))) {
+  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBCOLORS | FOUND_LAYOUTS))) {
     if (missing & FOUND_UPDATES)
-      settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Multiplies the three-finger drag speed");
+      settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Some touchpads briefly report");
     if (missing & FOUND_JUMP)
       settingsInsertLine(kHelpJump, "threeFingerDragJumpThreshold: 0", "# Key remaps");
     if (missing & FOUND_TBCOLORS)
       settingsInsertLine(kHelpTbColors, "titleBarColors: {}", "# Key remaps");
-  } else if (st->found != FOUND_ALL) {
+    if (missing & FOUND_LAYOUTS)
+      settingsInsertLine(kHelpLayouts, "keyRemapsForLayout: {}", "\x01");  // at the end
+  } else if (missing || (st->found & FOUND_OBSOLETE)) {
     settingsWrite();
   }
 
@@ -2700,8 +2836,8 @@ static void settingsApply(Settings *st, bool userEdit) {
     if (gWnd) { trayNotify(L"Some key remaps were skipped", gSettingsError); gSettingsError[0] = 0; }
   } else if (userEdit && (dragChanged || remapsChanged || tbChanged)) {
     wchar_t msg[200];
-    _snwprintf(msg, 200, L"%d key remaps active. Drag speed %.2fx, jump threshold %g mm%ls. Title bar colors for %d apps.",
-               gRemapCount, gSpeedMul, gJumpMm, gJumpMm <= 0 ? L" (off)" : L"", gTbAppCount);
+    _snwprintf(msg, 200, L"%d key remaps active. Jump threshold %g mm%ls. Title bar colors for %d apps.",
+               gRemapCount, gJumpMm, gJumpMm <= 0 ? L" (off)" : L"", gTbAppCount);
     trayNotify(L"Macify settings applied", msg);
   }
   if (userEdit && startupChanged && gWnd) applyStartup();
@@ -2710,9 +2846,23 @@ static void settingsApply(Settings *st, bool userEdit) {
 static void settingsDefaults(Settings *st) {
   memset(st, 0, sizeof *st);
   st->runAtStartup = st->runAsAdmin = st->checkUpdates = true;  // for anything the file leaves out
-  st->speed = 1.0;
   st->jump = 0;  // off: only some touchpads need it
   st->tbOldColor = RGB(0x20, 0x20, 0x20);
+}
+
+// Tray menu > Reset settings: after confirming, settings.yaml is rewritten with every
+// setting at its default (the learned pointer speed is kept).
+static void settingsReset(void) {
+  if (MessageBoxW(NULL,
+        L"Reset all Macify settings to their defaults?\n\n"
+        L"This rewrites settings.yaml, including your key remaps and title bar colors. "
+        L"The learned pointer speed is kept.",
+        L"Reset Macify settings", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND) != IDYES)
+    return;
+  static Settings st;
+  settingsDefaults(&st);  // found = 0: everything at its default, and the file rewritten
+  settingsApply(&st, true);
+  trayNotify(L"Macify settings reset", L"All settings are back to their defaults.");
 }
 
 static size_t readSmallFile(const wchar_t *path, char *text, size_t size) {
@@ -2737,7 +2887,7 @@ static void settingsLoad(bool userEdit) {
     settingsDefaults(&st);
     if (dataFile(json, L"settings.json") && readSmallFile(json, text, sizeof text) &&
         parseSettings(text, &st, err, sizeof err)) {
-      st.found &= ~FOUND_ALL;  // write the YAML file in any case
+      st.found |= FOUND_OBSOLETE;  // write the YAML file in any case
       settingsApply(&st, false);
       DeleteFileW(json);
       LOG("settings: converted settings.json to settings.yaml\n");
