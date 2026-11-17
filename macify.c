@@ -898,10 +898,11 @@ static SRWLOCK gRemapLock = SRWLOCK_INIT;
 static const char *const kDefaultRemaps[][2] = {
   { "Ctrl+D", "Delete" },           { "Ctrl+Backspace", "Delete" },
   { "Ctrl+Shift+3", "Win+PrintScreen" }, { "Ctrl+Shift+4", "Win+Shift+S" },
+  { "Ctrl+I", "Ctrl+Shift+C" },
   { "Alt+1", "Ctrl+Alt+1" },        { "Alt+2", "Ctrl+Alt+2" },        { "Alt+3", "Ctrl+Alt+3" },
   { "Alt+4", "Ctrl+Alt+4" },        { "Alt+7", "Ctrl+Alt+7" },        { "Alt+8", "Ctrl+Alt+8" },
-  { "Alt+9", "Ctrl+Alt+9" },        { "Alt+0", "Ctrl+Alt+0" },
-  { "Alt+´", "Ctrl+Alt+<" },   { "Alt+I", "Ctrl+Shift+C" },      { "Alt+<", "Ctrl+Alt+<" },
+  { "Alt+9", "Ctrl+Alt+9" },        { "Alt+0", "Ctrl+Alt+0" },        { "Alt++", "Ctrl+Alt++" },
+  { "Alt+´", "Ctrl+Alt+<" },   { "Alt+<", "Ctrl+Alt+<" },
 };
 
 static const struct { const char *name; UINT vk; } kKeyNames[] = {

@@ -65,9 +65,9 @@ Shortcuts that send other keys instead. These are the defaults:
 | Ctrl+D, Ctrl+Backspace | Delete |
 | Ctrl+Shift+3 | Win+PrintScreen (screenshot, saved to Pictures) |
 | Ctrl+Shift+4 | Win+Shift+S (snip part of the screen) |
-| Alt+1, 2, 3, 4, 7, 8, 9, 0 | The AltGr character on that key (such as `@ £ $ { [ ] }` on a Swedish layout) |
+| Ctrl+I | Ctrl+Shift+C |
+| Alt+1, 2, 3, 4, 7, 8, 9, 0, `+` | The AltGr character on that key (such as `@ £ $ { [ ] } \` on a Swedish layout) |
 | Alt+`´`, Alt+`<` | `\|` (AltGr+`<`) |
-| Alt+I | Ctrl+Shift+C |
 
 "Ctrl" includes the left Windows key. A remap only fires with exactly those modifiers
 held, the way AutoHotkey hotkeys do: Ctrl+D doesn't fire for Ctrl+Shift+D. Modifiers that
