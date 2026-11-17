@@ -117,8 +117,10 @@ keyRemapsForLayout:
     Alt+3: Ctrl+Alt+3
 ```
 
-- Each layout is written as its language tag: `sv-SE`, `en-US`, `de-DE`, `nb-NO`, …
-  The [debug log](#debug-mode) shows the current one.
+- Each layout is written as a language tag: `sv-SE`, `en-US`, `de-DE`, `nb-NO`, … It
+  matches that language's keyboard (`sv-SE`: the Swedish keyboard, even with English as
+  the input language), or else that input language with any keyboard. The keyboard comes
+  first. The [debug log](#debug-mode) shows both for the current layout.
 - For the same keys, a layout's remap replaces the one in `keyRemaps`; other keys still use
   `keyRemaps`.
 - Characters like `<` are the keys that type them on that layout.

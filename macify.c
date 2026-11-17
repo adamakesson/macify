@@ -157,7 +157,7 @@
 // Debug log: off unless switched on from the tray menu; then lines are collected in
 // memory and saved to the desktop on "Finish debug mode". Costs one check while off.
 static volatile bool gDebugOn;
-static LANGID gLoggedLang;  // the keyboard layout last written to the debug log
+static ULONG_PTR gLoggedHkl;  // the keyboard layout last written to the debug log
 static void debugLog(const char *fmt, ...);
 #define LOG(...) do { if (gDebugOn) debugLog(__VA_ARGS__); } while (0)
 static void debugStart(void);
@@ -1155,6 +1155,39 @@ static UINT charVk(wchar_t ch, UINT fallback) {
   return (UINT)(r & 0xFF);
 }
 
+// The language of a keyboard layout itself (Swedish for the Swedish keyboard), which can
+// differ from the input language Windows pairs it with (like English with a Swedish
+// keyboard). The high word of an HKL is that language, or for layout variants (0xFnnn)
+// an index looked up in the registry's list of keyboard layouts.
+static LANGID keyboardLang(HKL hkl) {
+  WORD dev = HIWORD((ULONG_PTR)hkl);
+  if ((dev & 0xF000) != 0xF000) return dev;
+  static WORD cachedDev;
+  static LANGID cachedLang;
+  if (dev == cachedDev) return cachedLang;
+  LANGID lang = 0;
+  HKEY key;
+  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+    wchar_t name[16], id[16];
+    for (DWORD i = 0; !lang; i++) {
+      DWORD nameLen = 16;
+      if (RegEnumKeyExW(key, i, name, &nameLen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+      DWORD size = sizeof id;
+      if (RegGetValueW(key, name, L"Layout Id", RRF_RT_REG_SZ, NULL, id, &size) == ERROR_SUCCESS &&
+          wcstoul(id, NULL, 16) == (dev & 0x0FFFu))
+        lang = (LANGID)(wcstoul(name, NULL, 16) & 0xFFFF);
+    }
+    RegCloseKey(key);
+  }
+  cachedDev = dev;
+  cachedLang = lang;
+  return lang;
+}
+
+static void tagFor(LANGID lang, wchar_t *tag) {
+  if (!lang || !LCIDToLocaleName(MAKELCID(lang, SORT_DEFAULT), tag, LOCALE_NAME_MAX_LENGTH, 0)) wcscpy(tag, L"?");
+}
+
 // The key remaps. Returns true if the key was handled (and must be swallowed). Like
 // AutoHotkey hotkeys, a remap fires only with exactly its modifiers held.
 static bool runHotkey(UINT vk) {
@@ -1168,24 +1201,30 @@ static bool runHotkey(UINT vk) {
   KeySpec out;
   bool found = false;
   // The current layout's remaps first, then those for every layout.
-  LANGID lang = LOWORD((ULONG_PTR)GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL)));
-  if (gDebugOn && lang != gLoggedLang) {  // shows the tag to use in keyRemapsForLayout
-    gLoggedLang = lang;
-    wchar_t tag[LOCALE_NAME_MAX_LENGTH] = L"?";
-    LCIDToLocaleName(MAKELCID(lang, SORT_DEFAULT), tag, LOCALE_NAME_MAX_LENGTH, 0);
-    LOG("keyboard layout: %ls\n", tag);
+  // A layout's remaps match its keyboard (sv-SE: a Swedish keyboard) or, failing that, its
+  // input language (sv-SE: Swedish with any keyboard). Then the remaps for every layout.
+  HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+  LANGID langs[3] = { keyboardLang(hkl), LOWORD((ULONG_PTR)hkl), 0 };
+  if (gDebugOn && (ULONG_PTR)hkl != gLoggedHkl) {  // shows the tag to use in keyRemapsForLayout
+    gLoggedHkl = (ULONG_PTR)hkl;
+    wchar_t kb[LOCALE_NAME_MAX_LENGTH], in[LOCALE_NAME_MAX_LENGTH];
+    tagFor(langs[0], kb);
+    tagFor(langs[1], in);
+    LOG("keyboard layout: %ls keyboard, %ls input language\n", kb, in);
   }
   AcquireSRWLockShared(&gRemapLock);
-  for (int pass = 0; pass < 2 && !found; pass++)
+  for (int pass = 0; pass < 3 && !found; pass++) {
+    if (pass < 2 && !langs[pass]) continue;
     for (int i = 0; i < gRemapCount && !found; i++) {
       const Remap *r = &gRemaps[i];
-      if (r->lang != (pass == 0 ? lang : 0) || r->from.mods != mods) continue;
+      if (r->lang != langs[pass] || r->from.mods != mods) continue;
       UINT fromVk = r->from.vk ? r->from.vk : charVk(r->from.ch, 0);
       if (!fromVk || fromVk != vk) continue;
       out = r->to;
       found = true;
       LOG("remap %s -> %s%s%s\n", r->fromText, r->toText, r->lang ? ", for " : "", r->layout);
     }
+  }
   ReleaseSRWLockShared(&gRemapLock);
   if (!found) return false;
   UINT outVk = out.vk ? out.vk : charVk(out.ch, 0);
@@ -2107,9 +2146,11 @@ static void logState(void) {
   logRegString("Windows build", L"CurrentBuild");
   {
     HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
-    wchar_t tag[LOCALE_NAME_MAX_LENGTH] = L"?";
-    LCIDToLocaleName(MAKELCID(LOWORD((ULONG_PTR)hkl), SORT_DEFAULT), tag, LOCALE_NAME_MAX_LENGTH, 0);
-    LOG("keyboard layout: %ls (layout id %08lX); logged again whenever it changes\n", tag, (unsigned long)(ULONG_PTR)hkl);
+    wchar_t kb[LOCALE_NAME_MAX_LENGTH], in[LOCALE_NAME_MAX_LENGTH];
+    tagFor(keyboardLang(hkl), kb);
+    tagFor(LOWORD((ULONG_PTR)hkl), in);
+    LOG("keyboard layout: %ls keyboard, %ls input language (id %08lX); logged again whenever it changes\n", kb, in,
+        (unsigned long)(ULONG_PTR)hkl);
   }
   LOG("check for updates on start: %s\n", gCheckUpdates ? "on" : "off");
   LOG("admin rights: %s, installed copy: %s, run at startup: %s\n", isElevated() ? "yes" : "no",
@@ -2150,7 +2191,7 @@ static void debugStart(void) {
   gLogFull = false;
   QueryPerformanceCounter(&gLogStart);
   gDebugOn = true;
-  gLoggedLang = 0;
+  gLoggedHkl = 0;
   LeaveCriticalSection(&gLogLock);
   logState();
   trayNotify(L"Macify debug mode started",
