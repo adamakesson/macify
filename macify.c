@@ -898,15 +898,10 @@ static SRWLOCK gRemapLock = SRWLOCK_INIT;
 static const char *const kDefaultRemaps[][2] = {
   { "Ctrl+D", "Delete" },           { "Ctrl+Backspace", "Delete" },
   { "Ctrl+Shift+3", "Win+PrintScreen" }, { "Ctrl+Shift+4", "Win+Shift+S" },
-  { "Ctrl+1", "Ctrl+Alt+1" },       { "Ctrl+2", "Ctrl+Alt+2" },       { "Ctrl+3", "Ctrl+Alt+3" },
-  { "Ctrl+4", "Ctrl+Alt+4" },       { "Ctrl+7", "Ctrl+Alt+7" },       { "Ctrl+8", "Ctrl+Alt+8" },
-  { "Ctrl+9", "Ctrl+Alt+9" },       { "Ctrl+0", "Ctrl+Alt+0" },
-  { "Ctrl+\u00B4", "Ctrl+Alt+<" },  { "Ctrl+I", "Ctrl+Shift+C" },
-  { "Ctrl++", "Ctrl+Alt++" },       { "Ctrl+-", "Win+-" },            { "Ctrl+<", "Ctrl+Alt+<" },
-  { "Alt+1", "Ctrl+1" },            { "Alt+2", "Ctrl+2" },            { "Alt+3", "Ctrl+3" },
-  { "Alt+4", "Ctrl+4" },            { "Alt+5", "Ctrl+5" },            { "Alt+6", "Ctrl+6" },
-  { "Alt+7", "Ctrl+7" },            { "Alt+8", "Ctrl+8" },            { "Alt+9", "Ctrl+9" },
-  { "Alt+0", "Ctrl+0" },            { "Alt++", "Ctrl++" },            { "Alt+-", "Ctrl+-" },
+  { "Alt+1", "Ctrl+Alt+1" },        { "Alt+2", "Ctrl+Alt+2" },        { "Alt+3", "Ctrl+Alt+3" },
+  { "Alt+4", "Ctrl+Alt+4" },        { "Alt+7", "Ctrl+Alt+7" },        { "Alt+8", "Ctrl+Alt+8" },
+  { "Alt+9", "Ctrl+Alt+9" },        { "Alt+0", "Ctrl+Alt+0" },
+  { "Alt+´", "Ctrl+Alt+<" },   { "Alt+I", "Ctrl+Shift+C" },      { "Alt+<", "Ctrl+Alt+<" },
 };
 
 static const struct { const char *name; UINT vk; } kKeyNames[] = {
