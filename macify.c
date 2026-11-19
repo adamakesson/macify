@@ -124,6 +124,7 @@
 #define WM_CANCEL_DRAG (WM_APP + 2)
 #define TIMER_SAVE 3
 #define TIMER_SETTINGS 4
+#define TIMER_ICONS 6
 #define TIMER_UPDATE_CHECK 5
 #define UPDATE_CHECK_DELAY_MS 30000  // after starting: give the network time to come up after login
 #define TASK_NAME L"Macify"
@@ -1923,6 +1924,450 @@ static void toggleSetting(bool *value) {
   applyStartup();
 }
 
+// ---------------------------------------------------------------- app icons
+//
+// Icons in the "appIconsFolder" folder (by default %APPDATA%\Macify\icons) replace app
+// icons: Plex.ico or Plex.png replaces the icon of Plex.exe. In the app's windows (title
+// bar, taskbar button, Alt+Tab) on the main thread, using the same window notifications as
+// the title bar colors; in its shortcuts (Start menu, taskbar pins, desktop) on a thread of
+// its own, which keeps the shortcuts' original icons in shortcut-icons.txt to put back.
+
+#define MAX_ICONS 64
+typedef struct {
+  wchar_t app[64];  // Plex.exe
+  HICON big, small;
+} AppIcon;
+static AppIcon gIcons[MAX_ICONS];
+static int gIconCount;
+static wchar_t gIconSetting[MAX_PATH];  // appIconsFolder as written ("" = default)
+static wchar_t gIconDir[MAX_PATH];      // resolved
+static SRWLOCK gIconDirLock = SRWLOCK_INIT;
+static HANDLE gIconWatch = INVALID_HANDLE_VALUE;
+static HANDLE gShortcutWake;            // tells the shortcut thread to look again
+static HWINEVENTHOOK gFgHook;
+
+static bool iconFileApp(const wchar_t *file, wchar_t *app) {  // Plex.png -> Plex.exe
+  const wchar_t *dot = wcsrchr(file, L'.');
+  if (!dot || (_wcsicmp(dot, L".ico") && _wcsicmp(dot, L".png")) || dot - file > 58) return false;
+  _snwprintf(app, 64, L"%.*ls.exe", (int)(dot - file), file);
+  return true;
+}
+
+static HICON loadIconFile(const wchar_t *path, int size) {
+  const wchar_t *dot = wcsrchr(path, L'.');
+  if (dot && !_wcsicmp(dot, L".ico")) return (HICON)LoadImageW(NULL, path, IMAGE_ICON, size, size, LR_LOADFROMFILE);
+  FILE *f = _wfopen(path, L"rb");  // .png: Windows makes icons straight from PNG data
+  if (!f) return NULL;
+  static BYTE data[4 << 20];
+  size_t n = fread(data, 1, sizeof data, f);
+  fclose(f);
+  return n ? CreateIconFromResourceEx(data, (DWORD)n, TRUE, 0x00030000, size, size, LR_DEFAULTCOLOR) : NULL;
+}
+
+// The program file name of a window's process.
+static bool windowExe(HWND w, wchar_t *name) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(w, &pid);
+  HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!p) return false;
+  wchar_t path[MAX_PATH];
+  DWORD n = MAX_PATH;
+  bool ok = QueryFullProcessImageNameW(p, 0, path, &n);
+  CloseHandle(p);
+  if (!ok) return false;
+  const wchar_t *base = wcsrchr(path, L'\\');
+  _snwprintf(name, 64, L"%ls", base ? base + 1 : path);
+  return true;
+}
+
+// Windows that have a taskbar button (and so an icon worth replacing).
+static bool appWindow(HWND w) {
+  if (GetAncestor(w, GA_ROOT) != w) return false;
+  LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+  if (ex & WS_EX_TOOLWINDOW) return false;
+  return !GetWindow(w, GW_OWNER) || (ex & WS_EX_APPWINDOW);
+}
+
+static const AppIcon *iconFor(const wchar_t *exe) {
+  for (int i = 0; i < gIconCount; i++)
+    if (!_wcsicmp(exe, gIcons[i].app)) return &gIcons[i];
+  return NULL;
+}
+
+static void setWindowIcons(HWND w, HICON big, HICON small) {
+  SendMessageTimeoutW(w, WM_SETICON, ICON_BIG, (LPARAM)big, SMTO_ABORTIFHUNG, 200, NULL);
+  SendMessageTimeoutW(w, WM_SETICON, ICON_SMALL, (LPARAM)small, SMTO_ABORTIFHUNG, 200, NULL);
+}
+
+// Gives a window its replacement icon, if its app has one. onlyIfChanged: only when the
+// app has put its own icon back.
+static void iconApply(HWND w, const wchar_t *exe, bool onlyIfChanged) {
+  const AppIcon *icon = iconFor(exe);
+  if (!icon || !appWindow(w)) return;
+  if (onlyIfChanged) {
+    DWORD_PTR current = 0;
+    SendMessageTimeoutW(w, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 200, &current);
+    if ((HICON)current == icon->big) return;
+  }
+  setWindowIcons(w, icon->big, icon->small);
+  LOG("app icon: applied to a %ls window\n", exe);
+}
+
+static void CALLBACK fgEvent(HWINEVENTHOOK h, DWORD ev, HWND w, LONG obj, LONG child, DWORD thread, DWORD time) {
+  (void)h; (void)ev; (void)obj; (void)child; (void)thread; (void)time;
+  wchar_t exe[64];
+  if (w && gIconCount && windowExe(w, exe)) iconApply(w, exe, true);
+}
+
+typedef struct { AppIcon *old; int oldCount; } IconEnum;
+
+static BOOL CALLBACK iconEnum(HWND w, LPARAM lp) {
+  IconEnum *e = (IconEnum *)lp;
+  wchar_t exe[64];
+  if (!IsWindowVisible(w) || !appWindow(w) || !windowExe(w, exe)) return TRUE;
+  if (iconFor(exe)) { iconApply(w, exe, false); return TRUE; }
+  for (int i = 0; i < e->oldCount; i++)  // its icon was removed: back to the app's own
+    if (!_wcsicmp(exe, e->old[i].app)) { setWindowIcons(w, NULL, NULL); break; }
+  return TRUE;
+}
+
+static void windowWatchUpdate(void);
+
+// (Re)loads the icons in the folder and updates open windows. Main thread.
+static void iconsLoad(void) {
+  static AppIcon old[MAX_ICONS];
+  int oldCount = gIconCount;
+  memcpy(old, gIcons, sizeof gIcons);
+  gIconCount = 0;
+  UINT dpi = GetDpiForSystem();
+  int big = MulDiv(32, dpi, 96), small = MulDiv(16, dpi, 96);
+  wchar_t pattern[MAX_PATH + 4], path[MAX_PATH];
+  _snwprintf(pattern, MAX_PATH + 4, L"%ls\\*", gIconDir);
+  WIN32_FIND_DATAW fd;
+  HANDLE h = gIconDir[0] ? FindFirstFileW(pattern, &fd) : INVALID_HANDLE_VALUE;
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      AppIcon icon;
+      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || gIconCount >= MAX_ICONS || !iconFileApp(fd.cFileName, icon.app)) continue;
+      if (iconFor(icon.app)) continue;  // both Plex.ico and Plex.png: the first one
+      _snwprintf(path, MAX_PATH, L"%ls\\%ls", gIconDir, fd.cFileName);
+      icon.big = loadIconFile(path, big);
+      icon.small = loadIconFile(path, small);
+      if (!icon.big || !icon.small) {
+        LOG("app icon: couldn't read %ls\n", fd.cFileName);
+        if (icon.big) DestroyIcon(icon.big);
+        if (icon.small) DestroyIcon(icon.small);
+        continue;
+      }
+      gIcons[gIconCount++] = icon;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  LOG("app icons: %d in %ls\n", gIconCount, gIconDir);
+  windowWatchUpdate();
+  IconEnum e = { old, oldCount };
+  EnumWindows(iconEnum, (LPARAM)&e);
+  for (int i = 0; i < oldCount; i++) {  // the windows have the new ones by now
+    DestroyIcon(old[i].big);
+    DestroyIcon(old[i].small);
+  }
+  if (gShortcutWake) SetEvent(gShortcutWake);
+}
+
+// ---- shortcuts (their own thread)
+
+typedef struct { wchar_t lnk[MAX_PATH], icon[MAX_PATH]; int index; } ShortcutRecord;
+static ShortcutRecord gRecords[256];
+static int gRecordCount;
+static bool gRecordsDirty;
+
+static void recordsLoad(void) {
+  gRecordCount = 0;
+  wchar_t path[MAX_PATH];
+  if (!dataFile(path, L"shortcut-icons.txt")) return;
+  FILE *f = _wfopen(path, L"rb");  // UTF-16, as written below
+  if (!f) return;
+  wchar_t line[MAX_PATH * 2 + 32];
+  while (gRecordCount < 256 && fgetws(line, MAX_PATH * 2 + 32, f)) {
+    wchar_t *tab1 = wcschr(line, L'\t'), *tab2 = tab1 ? wcschr(tab1 + 1, L'\t') : NULL;
+    if (!tab2) continue;
+    *tab1 = *tab2 = 0;
+    ShortcutRecord *r = &gRecords[gRecordCount++];
+    _snwprintf(r->lnk, MAX_PATH, L"%ls", line);
+    _snwprintf(r->icon, MAX_PATH, L"%ls", tab1 + 1);
+    r->index = _wtoi(tab2 + 1);
+  }
+  fclose(f);
+}
+
+static void recordsSave(void) {
+  wchar_t path[MAX_PATH];
+  if (!gRecordsDirty || !dataFile(path, L"shortcut-icons.txt")) return;
+  gRecordsDirty = false;
+  if (!gRecordCount) { DeleteFileW(path); return; }
+  FILE *f = _wfopen(path, L"wb");
+  if (!f) return;
+  for (int i = 0; i < gRecordCount; i++) fwprintf(f, L"%ls\t%ls\t%d\n", gRecords[i].lnk, gRecords[i].icon, gRecords[i].index);
+  fclose(f);
+}
+
+static ShortcutRecord *recordFor(const wchar_t *lnk) {
+  for (int i = 0; i < gRecordCount; i++)
+    if (!_wcsicmp(gRecords[i].lnk, lnk)) return &gRecords[i];
+  return NULL;
+}
+
+static void recordDrop(ShortcutRecord *r) {
+  *r = gRecords[--gRecordCount];
+  gRecordsDirty = true;
+}
+
+// A shortcut icon must be an .ico file: a PNG gets an .ico wrapper in icon-cache.
+static bool shortcutIconPath(const wchar_t *dir, const wchar_t *file, wchar_t *out) {
+  _snwprintf(out, MAX_PATH, L"%ls\\%ls", dir, file);
+  const wchar_t *dot = wcsrchr(file, L'.');
+  if (_wcsicmp(dot, L".png")) return true;
+  wchar_t cacheDir[MAX_PATH], cached[MAX_PATH];
+  if (!dataFile(cacheDir, L"icon-cache")) return false;
+  CreateDirectoryW(cacheDir, NULL);
+  _snwprintf(cached, MAX_PATH, L"%ls\\%.*ls.ico", cacheDir, (int)(dot - file), file);
+  WIN32_FILE_ATTRIBUTE_DATA src, dst;
+  if (GetFileAttributesExW(cached, GetFileExInfoStandard, &dst) && GetFileAttributesExW(out, GetFileExInfoStandard, &src) &&
+      CompareFileTime(&dst.ftLastWriteTime, &src.ftLastWriteTime) >= 0) {
+    wcscpy(out, cached);
+    return true;
+  }
+  FILE *f = _wfopen(out, L"rb");
+  if (!f) return false;
+  static BYTE png[4 << 20];
+  size_t n = fread(png, 1, sizeof png, f);
+  fclose(f);
+  if (n < 24 || memcmp(png, "\x89PNG", 4)) return false;
+  unsigned w = (png[16] << 24) | (png[17] << 16) | (png[18] << 8) | png[19];
+  unsigned h = (png[20] << 24) | (png[21] << 16) | (png[22] << 8) | png[23];
+  BYTE head[22] = { 0, 0, 1, 0, 1, 0, (BYTE)(w >= 256 ? 0 : w), (BYTE)(h >= 256 ? 0 : h), 0, 0, 1, 0, 32, 0,
+                    (BYTE)n, (BYTE)(n >> 8), (BYTE)(n >> 16), (BYTE)(n >> 24), 22, 0, 0, 0 };
+  f = _wfopen(cached, L"wb");
+  if (!f) return false;
+  fwrite(head, 1, sizeof head, f);
+  fwrite(png, 1, n, f);
+  fclose(f);
+  wcscpy(out, cached);
+  return true;
+}
+
+// The app a shortcut starts: its target's file name, or for apps started through
+// Squirrel's Update.exe (Discord, Teams, ...) the app after "--processStart".
+static bool shortcutApp(IShellLinkW *link, wchar_t *app) {
+  wchar_t target[MAX_PATH], args[1024];
+  if (IShellLinkW_GetPath(link, target, MAX_PATH, NULL, 0) != S_OK || !target[0]) return false;
+  const wchar_t *base = wcsrchr(target, L'\\');
+  base = base ? base + 1 : target;
+  if (!_wcsicmp(base, L"Update.exe") && SUCCEEDED(IShellLinkW_GetArguments(link, args, 1024))) {
+    wchar_t *p = wcsstr(args, L"--processStart");
+    if (p) {
+      p += 14;
+      while (*p == L' ') p++;
+      bool quoted = *p == L'"';
+      if (quoted) p++;
+      wchar_t *end = p;
+      while (*end && (quoted ? *end != L'"' : *end != L' ')) end++;
+      _snwprintf(app, 64, L"%.*ls", (int)(end - p), p);
+      return *app != 0;
+    }
+  }
+  _snwprintf(app, 64, L"%ls", base);
+  return true;
+}
+
+typedef struct { wchar_t app[64], file[64]; } IconFile;
+
+// Brings one shortcut in line with the icons folder. Returns true if it changed.
+static bool shortcutUpdate(const wchar_t *lnk, const IconFile *icons, int iconCount, const wchar_t *dir) {
+  IShellLinkW *link;
+  IPersistFile *file;
+  bool changed = false;
+  if (FAILED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&link))) return false;
+  if (SUCCEEDED(IShellLinkW_QueryInterface(link, &IID_IPersistFile, (void **)&file))) {
+    wchar_t app[64], current[MAX_PATH] = L"", wanted[MAX_PATH] = L"";
+    int index = 0;
+    if (SUCCEEDED(IPersistFile_Load(file, lnk, STGM_READ)) && shortcutApp(link, app)) {
+      IShellLinkW_GetIconLocation(link, current, MAX_PATH, &index);
+      for (int i = 0; i < iconCount && !wanted[0]; i++)
+        if (!_wcsicmp(app, icons[i].app) && !shortcutIconPath(dir, icons[i].file, wanted)) wanted[0] = 0;
+      ShortcutRecord *r = recordFor(lnk);
+      if (wanted[0] && (_wcsicmp(current, wanted) || index != 0)) {
+        // Is the current icon one of ours (an earlier icon for this app)? Then the
+        // recorded original stays; otherwise it's the original, possibly rewritten by an
+        // app update since.
+        const wchar_t *curFile = wcsrchr(current, L'\\');
+        curFile = curFile ? curFile + 1 : current;
+        size_t appLen = wcslen(app) - 4;  // without .exe
+        bool ours = r && ((dir[0] && !_wcsnicmp(current, dir, wcslen(dir))) || wcsstr(current, L"\\Macify\\icon-cache\\") ||
+                          (!_wcsnicmp(curFile, app, appLen) && curFile[appLen] == L'.'));
+        if (!r && gRecordCount < 256) r = &gRecords[gRecordCount++];
+        if (r) {
+          if (!ours) {
+            _snwprintf(r->lnk, MAX_PATH, L"%ls", lnk);
+            _snwprintf(r->icon, MAX_PATH, L"%ls", current);
+            r->index = index;
+            gRecordsDirty = true;
+          }
+          IShellLinkW_SetIconLocation(link, wanted, 0);
+          changed = SUCCEEDED(IPersistFile_Save(file, lnk, TRUE));
+        }
+      } else if (!wanted[0] && r) {  // its icon was removed: put the original back
+        IShellLinkW_SetIconLocation(link, r->icon, r->index);
+        changed = SUCCEEDED(IPersistFile_Save(file, lnk, TRUE));
+        recordDrop(r);
+      }
+    }
+    IPersistFile_Release(file);
+  }
+  IShellLinkW_Release(link);
+  if (changed) {
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, lnk, NULL);
+    LOG("app icon: updated shortcut %ls\n", lnk);
+  }
+  return changed;
+}
+
+static int shortcutsInFolder(const wchar_t *dir, int depth, const IconFile *icons, int iconCount, const wchar_t *iconDir) {
+  wchar_t pattern[MAX_PATH], path[MAX_PATH];
+  _snwprintf(pattern, MAX_PATH, L"%ls\\*", dir);
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  int changed = 0;
+  do {
+    if (fd.cFileName[0] == L'.') continue;
+    _snwprintf(path, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      if (depth < 4) changed += shortcutsInFolder(path, depth + 1, icons, iconCount, iconDir);
+    } else {
+      const wchar_t *dot = wcsrchr(fd.cFileName, L'.');
+      if (dot && !_wcsicmp(dot, L".lnk")) changed += shortcutUpdate(path, icons, iconCount, iconDir);
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  return changed;
+}
+
+#define SHORTCUT_FOLDERS 5
+static void shortcutFolders(wchar_t dirs[SHORTCUT_FOLDERS][MAX_PATH]) {
+  static const int ids[SHORTCUT_FOLDERS - 1] = { CSIDL_PROGRAMS, CSIDL_COMMON_PROGRAMS, CSIDL_DESKTOPDIRECTORY,
+                                                 CSIDL_COMMON_DESKTOPDIRECTORY };
+  for (int i = 0; i < SHORTCUT_FOLDERS - 1; i++)
+    if (FAILED(SHGetFolderPathW(NULL, ids[i], NULL, 0, dirs[i]))) dirs[i][0] = 0;
+  const wchar_t *appData = _wgetenv(L"APPDATA");  // taskbar pins
+  _snwprintf(dirs[SHORTCUT_FOLDERS - 1], MAX_PATH, L"%ls\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned",
+             appData ? appData : L"");
+}
+
+// Every shortcut against the icons folder; with restoreAll, every recorded shortcut back
+// to its original icon (for uninstalling).
+static void shortcutsUpdate(bool restoreAll) {
+  static IconFile icons[MAX_ICONS];
+  int iconCount = 0;
+  wchar_t dir[MAX_PATH];
+  AcquireSRWLockShared(&gIconDirLock);
+  wcscpy(dir, gIconDir);
+  ReleaseSRWLockShared(&gIconDirLock);
+  if (!restoreAll && dir[0]) {
+    wchar_t pattern[MAX_PATH + 4];
+    _snwprintf(pattern, MAX_PATH + 4, L"%ls\\*", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && iconCount < MAX_ICONS && wcslen(fd.cFileName) < 64 &&
+            iconFileApp(fd.cFileName, icons[iconCount].app)) {
+          wcscpy(icons[iconCount].file, fd.cFileName);
+          iconCount++;
+        }
+      } while (FindNextFileW(h, &fd));
+      FindClose(h);
+    }
+  }
+  recordsLoad();
+  wchar_t dirs[SHORTCUT_FOLDERS][MAX_PATH];
+  shortcutFolders(dirs);
+  int changed = 0;
+  for (int i = 0; i < SHORTCUT_FOLDERS; i++)
+    if (dirs[i][0]) changed += shortcutsInFolder(dirs[i], 0, icons, iconCount, dir);
+  for (int i = gRecordCount - 1; i >= 0; i--)  // recorded shortcuts that are gone
+    if (GetFileAttributesW(gRecords[i].lnk) == INVALID_FILE_ATTRIBUTES) recordDrop(&gRecords[i]);
+  recordsSave();
+  if (changed) SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);  // refresh icons everywhere
+}
+
+static DWORD WINAPI shortcutThread(void *arg) {
+  (void)arg;
+  CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+  wchar_t dirs[SHORTCUT_FOLDERS][MAX_PATH];
+  shortcutFolders(dirs);
+  HANDLE handles[SHORTCUT_FOLDERS + 1];
+  DWORD count = 0;
+  handles[count++] = gShortcutWake;
+  for (int i = 0; i < SHORTCUT_FOLDERS; i++) {
+    HANDLE h = dirs[i][0] ? FindFirstChangeNotificationW(dirs[i], TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE)
+                          : INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE) handles[count++] = h;
+  }
+  for (;;) {
+    DWORD r = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+    if (r >= WAIT_OBJECT_0 + count) break;
+    if (r > WAIT_OBJECT_0) {  // shortcuts were added or changed (an app installed or updated)
+      FindNextChangeNotification(handles[r - WAIT_OBJECT_0]);
+      Sleep(2000);  // let the installer finish
+      for (DWORD i = 1; i < count; i++)  // and take the notifications that came meanwhile
+        if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) FindNextChangeNotification(handles[i]);
+    }
+    shortcutsUpdate(false);
+  }
+  return 0;
+}
+
+// ---- settings and startup
+
+// The folder appIconsFolder names ("" = the icons folder next to the settings).
+static void iconDirResolve(const wchar_t *setting, wchar_t *out) {
+  if (!setting[0]) {
+    if (!dataFile(out, L"icons")) { out[0] = 0; return; }
+    CreateDirectoryW(out, NULL);
+    return;
+  }
+  if (!ExpandEnvironmentStringsW(setting, out, MAX_PATH)) wcscpy(out, setting);
+  for (wchar_t *c = out; *c; c++) if (*c == L'/') *c = L'\\';
+  size_t n = wcslen(out);
+  if (n > 3 && out[n - 1] == L'\\') out[n - 1] = 0;
+}
+
+// After loading settings, and at startup. Main thread of the running copy only.
+static void iconsUpdate(void) {
+  if (!gWnd) return;
+  wchar_t dir[MAX_PATH];
+  iconDirResolve(gIconSetting, dir);
+  bool moved = wcscmp(dir, gIconDir) != 0;
+  if (moved || !gShortcutWake) {
+    AcquireSRWLockExclusive(&gIconDirLock);
+    wcscpy(gIconDir, dir);
+    ReleaseSRWLockExclusive(&gIconDirLock);
+    if (gIconWatch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(gIconWatch);
+    gIconWatch = dir[0] ? FindFirstChangeNotificationW(dir, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE)
+                        : INVALID_HANDLE_VALUE;
+    if (dir[0] && gIconWatch == INVALID_HANDLE_VALUE) LOG("app icons: folder %ls not found\n", dir);
+  }
+  if (!gShortcutWake) {
+    gShortcutWake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HANDLE t = CreateThread(NULL, 0, shortcutThread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    iconsLoad();
+  } else if (moved) {
+    iconsLoad();
+  }
+}
+
 // ---------------------------------------------------------------- title bar colors
 //
 // Windows of the apps in "titleBarColors" get a title bar in that app's color, set from
@@ -1937,21 +2382,10 @@ static int gTbAppCount;
 static HWINEVENTHOOK gTbHook;
 
 // The app's index in titleBarColors, or -1.
-static int tbAppFor(HWND w) {
-  if (!gTbAppCount || GetAncestor(w, GA_ROOT) != w || !(GetWindowLongW(w, GWL_STYLE) & WS_CAPTION)) return -1;
-  DWORD pid = 0;
-  GetWindowThreadProcessId(w, &pid);
-  HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (!p) return -1;
-  wchar_t path[MAX_PATH];
-  DWORD n = MAX_PATH;
-  bool ok = QueryFullProcessImageNameW(p, 0, path, &n);
-  CloseHandle(p);
-  if (!ok) return -1;
-  const wchar_t *name = wcsrchr(path, L'\\');
-  name = name ? name + 1 : path;
+static int tbAppFor(HWND w, const wchar_t *exe) {
+  if (GetAncestor(w, GA_ROOT) != w || !(GetWindowLongW(w, GWL_STYLE) & WS_CAPTION)) return -1;
   for (int i = 0; i < gTbAppCount; i++)
-    if (!_wcsicmp(name, gTbApps[i])) return i;
+    if (!_wcsicmp(exe, gTbApps[i])) return i;
   return -1;
 }
 
@@ -1965,30 +2399,46 @@ static void tbApply(HWND w, COLORREF color) {
   DwmSetWindowAttribute(w, 36, &text, sizeof text);                // DWMWA_TEXT_COLOR (Windows 11)
 }
 
+// A window was shown: its title bar color and icon.
 static void CALLBACK tbEvent(HWINEVENTHOOK h, DWORD ev, HWND w, LONG obj, LONG child, DWORD thread, DWORD time) {
   (void)h; (void)ev; (void)thread; (void)time;
-  int app;
-  if (w && obj == OBJID_WINDOW && child == CHILDID_SELF && (app = tbAppFor(w)) >= 0) {
+  wchar_t exe[64];
+  if (!w || obj != OBJID_WINDOW || child != CHILDID_SELF || !windowExe(w, exe)) return;
+  int app = tbAppFor(w, exe);
+  if (app >= 0) {
     tbApply(w, gTbColors[app]);
     LOG("title bar color: applied to a new window\n");
   }
+  iconApply(w, exe, false);
 }
 
 static BOOL CALLBACK tbEnum(HWND w, LPARAM lp) {
   (void)lp;
-  int app = IsWindowVisible(w) ? tbAppFor(w) : -1;
+  wchar_t exe[64];
+  int app = IsWindowVisible(w) && windowExe(w, exe) ? tbAppFor(w, exe) : -1;
   if (app >= 0) tbApply(w, gTbColors[app]);
   return TRUE;
+}
+
+// Window notifications only while something needs them: shown windows for title bar
+// colors and icons, and the foreground window for icons an app has put back.
+static void windowWatchUpdate(void) {
+  bool show = gTbAppCount || gIconCount;
+  if (show && !gTbHook)
+    gTbHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL, tbEvent, 0, 0,
+                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+  if (!show && gTbHook) { UnhookWinEvent(gTbHook); gTbHook = NULL; }
+  if (gIconCount && !gFgHook)
+    gFgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, fgEvent, 0, 0,
+                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+  if (!gIconCount && gFgHook) { UnhookWinEvent(gFgHook); gFgHook = NULL; }
 }
 
 // After loading settings: watch for windows only if there are apps, and update the
 // windows already open.
 static void titleBarsUpdate(void) {
   if (!gWnd) return;  // not the running copy (installer, updater)
-  if (gTbAppCount && !gTbHook)
-    gTbHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL, tbEvent, 0, 0,
-                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-  if (!gTbAppCount && gTbHook) { UnhookWinEvent(gTbHook); gTbHook = NULL; }
+  windowWatchUpdate();
   if (gTbAppCount) EnumWindows(tbEnum, 0);
 }
 
@@ -1997,16 +2447,17 @@ static void titleBarsUpdate(void) {
 // From Settings > Apps ("--uninstall"): asks first, then (with admin
 // rights) closes Macify and removes everything it added.
 
-static void deleteFolder(const wchar_t *dir) {  // our folders only hold plain files
+static void deleteFolder(const wchar_t *dir) {
   wchar_t pattern[MAX_PATH], path[MAX_PATH];
   _snwprintf(pattern, MAX_PATH, L"%ls\\*", dir);
   WIN32_FIND_DATAW fd;
   HANDLE h = FindFirstFileW(pattern, &fd);
   if (h != INVALID_HANDLE_VALUE) {
     do {
-      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+      if (fd.cFileName[0] == L'.') continue;
       _snwprintf(path, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
-      DeleteFileW(path);
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) deleteFolder(path);
+      else DeleteFileW(path);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
   }
@@ -2022,12 +2473,13 @@ static int uninstallNow(DWORD waitPid) {
 
   deleteTask();
   setRunEntry(NULL);
+  if (SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) shortcutsUpdate(true);  // original icons back
   const wchar_t *appData = _wgetenv(L"APPDATA");
   if (appData) {
     wchar_t path[MAX_PATH];
     _snwprintf(path, MAX_PATH, L"%ls\\Microsoft\\Windows\\Start Menu\\Programs\\Macify.lnk", appData);
     DeleteFileW(path);
-    _snwprintf(path, MAX_PATH, L"%ls\\Macify", appData);  // settings, learned speed curve
+    _snwprintf(path, MAX_PATH, L"%ls\\Macify", appData);  // settings, learned speed curve, icons
     deleteFolder(path);
   }
   RegDeleteTreeW(HKEY_LOCAL_MACHINE, UNINSTALL_KEY);
@@ -2058,7 +2510,8 @@ static bool confirmUninstall(void) {
   return MessageBoxW(NULL,
     L"Uninstall Macify?\n\n"
     L"This closes Macify and removes it from this PC: the program, its startup task, its "
-    L"Start menu shortcut, your settings and the learned pointer speed.",
+    L"Start menu shortcut, your settings, the learned pointer speed and the icons folder. "
+    L"Shortcuts get their original icons back.",
     L"Uninstall Macify", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES;
 }
 
@@ -2241,7 +2694,8 @@ static void debugFinish(void) {
 #define FOUND_JUMP    32
 #define FOUND_TBCOLORS 64
 #define FOUND_LAYOUTS 128
-#define FOUND_ALL     (255 & ~FOUND_FREE)
+#define FOUND_ICONS   256
+#define FOUND_ALL     (511 & ~FOUND_FREE)
 #define FOUND_OBSOLETE 1024  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
@@ -2253,6 +2707,7 @@ typedef struct {
   COLORREF tbColors[MAX_TB_APPS];
   int tbAppCount;
   COLORREF tbOldColor;  // darkTitleBarColor (1.20 only), for converting to titleBarColors
+  char iconFolder[MAX_PATH];
   char skipped[400];  // key remaps that couldn't be used, and why
   int found;          // which settings the file had: FOUND_* bits
 } Settings;
@@ -2408,7 +2863,7 @@ static bool yamlScalar(const char *in, char *out, size_t n) {
       if (*in == q) {
         if (q == '\'' && in[1] == '\'') in++;  // '' is a quote inside '...'
         else { out[o] = 0; return *yamlTrim((char *)in + 1) == 0; }
-      } else if (q == '"' && *in == '\\' && in[1]) in++;
+      } else if (q == '"' && *in == '\\' && (in[1] == '"' || in[1] == '\\')) in++;  // other \ stay: C:\Users
       if (o + 1 < n) out[o++] = *in;
     }
     return false;
@@ -2496,7 +2951,7 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
     if (listEntry && inColors) content = yamlTrim(content + 1);  // also accept  - Plex.exe: "#202020"
     else if (listEntry) { snprintf(err, errLen, "line %d is a list entry (- ...), which isn't used here", lineNo); return false; }
 
-    char *rawKey, *rawValue, key[64], value[64];
+    char *rawKey, *rawValue, key[64], value[MAX_PATH];
     if (!yamlSplit(content, &rawKey, &rawValue)) {
       bool openQuote = (content[0] == '"' || content[0] == '\'') && !strchr(content + 1, content[0]);
       snprintf(err, errLen, openQuote ? "a quote isn't closed on line %d" : "line %d should look like name: value", lineNo);
@@ -2538,7 +2993,10 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
     }
 
     inRemaps = inColors = inOldApps = inLayouts = false;
-    if (!strcmp(key, "titleBarColors")) {
+    if (!strcmp(key, "appIconsFolder")) {
+      snprintf(st->iconFolder, sizeof st->iconFolder, "%s", value);
+      st->found |= FOUND_ICONS;
+    } else if (!strcmp(key, "titleBarColors")) {
       if (*value && strcmp(rawValue, "{}") != 0) {
         snprintf(err, errLen, "titleBarColors (line %d) should be followed by indented lines like  Plex.exe: \"#202020\"", lineNo);
         return false;
@@ -2626,6 +3084,11 @@ static const char kHelpJump[] =
   "# between two touchpad reports is held back until it's clear whether it was real. It never\n"
   "# limits how fast you can drag. 0 (the default) turns this off. If your cursor jumps when\n"
   "# you start a drag fast, try 3.\n";
+static const char kHelpIcons[] =
+  "# Folder with replacement app icons, each named after the app's program file (see Task\n"
+  "# Manager > Details): Plex.ico or Plex.png replaces the icon of Plex.exe, in its windows\n"
+  "# and in its shortcuts (Start menu, taskbar pins, desktop). Adding or removing an icon\n"
+  "# applies at once. \"\" means the icons folder next to this file.\n";
 static const char kHelpTbColors[] =
   "# Title bar colors for apps, such as apps that keep a light title bar in dark mode. One\n"
   "# indented line each: the app's program file name (see Task Manager > Details), then the\n"
@@ -2702,7 +3165,11 @@ static void settingsWrite(void) {
           kHelpTop, kHelpStartup, gRunAtStartup ? "true" : "false", kHelpAdmin, gRunAsAdmin ? "true" : "false",
           kHelpUpdates, gCheckUpdates ? "true" : "false", kHelpJump, jump, kHelpTbColors);
   tbPutColors(f);
-  fprintf(f, "\n%s", kHelpRemaps);
+  char folder[MAX_PATH];
+  snprintf(folder, sizeof folder, "%ls", gIconSetting);
+  fprintf(f, "\n%sappIconsFolder: ", kHelpIcons);
+  yamlPut(f, folder);
+  fprintf(f, "\n\n%s", kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
   int general = 0, layouts = 0;
   for (int i = 0; i < gRemapCount; i++) { if (gRemaps[i].lang) layouts++; else general++; }
@@ -2851,6 +3318,8 @@ static void settingsApply(Settings *st, bool userEdit) {
   }
   gTbAppCount = st->tbAppCount;
   titleBarsUpdate();
+  if (!MultiByteToWideChar(CP_UTF8, 0, st->iconFolder, -1, gIconSetting, MAX_PATH)) gIconSetting[0] = 0;
+  iconsUpdate();
   LOG("settings: runAtStartup %d, runAsAdministrator %d, checkForUpdatesOnStart %d, "
       "threeFingerDragJumpThreshold %.1f, %d title bar colors, %d key remaps\n", gRunAtStartup, gRunAsAdmin, gCheckUpdates,
       gJumpMm, gTbAppCount, gRemapCount);
@@ -2859,13 +3328,15 @@ static void settingsApply(Settings *st, bool userEdit) {
   // Settings added since: insert just those, keeping the user's file (and comments) as is.
   if ((st->found & FOUND_SPEED) && !(st->found & FOUND_OBSOLETE)) settingsRemoveLine("threeFingerDragSpeed", kHelpSpeedOld);
   int missing = FOUND_ALL & ~st->found;
-  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBCOLORS | FOUND_LAYOUTS))) {
+  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBCOLORS | FOUND_LAYOUTS | FOUND_ICONS))) {
     if (missing & FOUND_UPDATES)
       settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Some touchpads briefly report");
     if (missing & FOUND_JUMP)
       settingsInsertLine(kHelpJump, "threeFingerDragJumpThreshold: 0", "# Key remaps");
     if (missing & FOUND_TBCOLORS)
       settingsInsertLine(kHelpTbColors, "titleBarColors: {}", "# Key remaps");
+    if (missing & FOUND_ICONS)
+      settingsInsertLine(kHelpIcons, "appIconsFolder: \"\"", "# Key remaps");
     if (missing & FOUND_LAYOUTS)
       settingsInsertLine(kHelpLayouts, "keyRemapsForLayout: {}", "\x01");  // at the end
   } else if (missing || (st->found & FOUND_OBSOLETE)) {
@@ -3264,6 +3735,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
       if (wp == TIMER_RELEASE) { endDrag(); return 0; }
       if (wp == TIMER_SETTINGS) { KillTimer(w, TIMER_SETTINGS); settingsLoad(true); return 0; }
+      if (wp == TIMER_ICONS) { KillTimer(w, TIMER_ICONS); iconsLoad(); return 0; }
       if (wp == TIMER_UPDATE_CHECK) { KillTimer(w, TIMER_UPDATE_CHECK); if (gCheckUpdates) updateCheck(true); return 0; }
       if (wp == TIMER_TRAY_RETRY) { trayAdd(); return 0; }
       if (wp == TIMER_SAVE) {
@@ -3414,6 +3886,7 @@ static int run(void) {
 
   curveLoad();
   settingsLoad(false);
+  iconsUpdate();
   titleBarsUpdate();  // the first settingsLoad ran before there was a window, and this one
                       // skips the unchanged file: title bars wouldn't be colored until an edit
   settingsWatchStart();
@@ -3439,11 +3912,20 @@ static int run(void) {
 
   MSG m;
   for (bool running = true; running;) {
-    DWORD handles = gSettingsWatch != INVALID_HANDLE_VALUE ? 1 : 0;
-    DWORD r = MsgWaitForMultipleObjects(handles, &gSettingsWatch, FALSE, INFINITE, QS_ALLINPUT);
-    if (handles && r == WAIT_OBJECT_0) {  // something in %APPDATA%\Macify changed:
+    HANDLE watch[2];
+    DWORD handles = 0;
+    int settingsAt = -1, iconsAt = -1;
+    if (gSettingsWatch != INVALID_HANDLE_VALUE) { settingsAt = handles; watch[handles++] = gSettingsWatch; }
+    if (gIconWatch != INVALID_HANDLE_VALUE) { iconsAt = handles; watch[handles++] = gIconWatch; }
+    DWORD r = MsgWaitForMultipleObjects(handles, watch, FALSE, INFINITE, QS_ALLINPUT);
+    if (settingsAt >= 0 && r == WAIT_OBJECT_0 + (DWORD)settingsAt) {  // something in %APPDATA%\Macify changed:
       SetTimer(gWnd, TIMER_SETTINGS, 150, NULL);  // look once the editor has finished writing
       FindNextChangeNotification(gSettingsWatch);
+      continue;
+    }
+    if (iconsAt >= 0 && r == WAIT_OBJECT_0 + (DWORD)iconsAt) {  // an icon was added, changed or removed
+      SetTimer(gWnd, TIMER_ICONS, 300, NULL);
+      FindNextChangeNotification(gIconWatch);
       continue;
     }
     while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {

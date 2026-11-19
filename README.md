@@ -23,6 +23,7 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
   with Ctrl or Alt held is a right-button drag.
 - **Title bar colors** for apps that don't follow Windows' dark mode (see
   [Title bar colors](#title-bar-colors)).
+- **App icons**: replace any app's icon with your own (see [App icons](#app-icons)).
 
 ## Three-finger drag
 
@@ -153,6 +154,29 @@ titleBarColors:
 
 `titleBarColors: {}` (the default) means none.
 
+## App icons
+
+Put an icon named after an app's program file in Macify's icons folder and it replaces that
+app's icon: `Plex.ico` or `Plex.png` replaces the icon of `Plex.exe`. The folder is
+`%APPDATA%\Macify\icons`, or any folder you set as `appIconsFolder` in the
+[settings file](#settings).
+
+- The new icon shows in the app's **windows** (title bar, taskbar button, Alt+Tab) and its
+  **shortcuts** (Start menu, taskbar pins, desktop).
+- Program file names are shown in Task Manager → Details. Upper or lower case doesn't
+  matter.
+- Adding, changing or removing an icon applies at once. Removing one gives the app its own
+  icon back, in its shortcuts too: Macify remembers their original icons
+  (`shortcut-icons.txt`), and puts them back when uninstalled.
+- When an app update puts its original shortcut back, Macify changes it again. When an
+  app sets its own icon again while running, its window gets the new icon back the next
+  time you switch to it.
+- Apps started through `Update.exe` (Discord, for example) are recognized by the app they
+  start.
+- Windows caches taskbar pin icons, so a pinned app can take a sign-out (or restarting
+  Explorer) to show its new icon.
+- Microsoft Store apps can't be changed this way.
+
 ## Setup
 
 1. In **Settings → Bluetooth & devices → Touchpad**, set three-finger swipes and taps to
@@ -182,6 +206,7 @@ runAsAdministrator: true
 checkForUpdatesOnStart: true
 threeFingerDragJumpThreshold: 0
 titleBarColors: {}
+appIconsFolder: ""
 keyRemaps:
   Ctrl+D: Delete
   # ... the other key remaps
@@ -201,6 +226,7 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `checkForUpdatesOnStart` | Shortly after Macify starts, check here for a newer version. If there is one, it's downloaded in the background and a notification offers it: click it, or choose **Install Macify …** in the tray menu. Silent when there's nothing new |
 | `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` (the default) turns it off; if your cursor jumps when you start a drag fast, try `3` |
 | `titleBarColors` | Apps whose title bar gets a color, see [Title bar colors](#title-bar-colors). `{}` (the default) means none |
+| `appIconsFolder` | Folder with replacement app icons, see [App icons](#app-icons). `""` (the default) means `%APPDATA%\Macify\icons`. Environment variables like `%USERPROFILE%` work |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
 | `keyRemapsForLayout` | Key remaps for one keyboard layout, see [For one keyboard layout](#for-one-keyboard-layout) |
 
@@ -235,7 +261,9 @@ release as release notes. Installed copies pick it up with **Check for updates**
 **Settings → Apps → Installed apps → Macify → Uninstall**, like any other app. After a
 confirmation and a UAC prompt, Macify closes and removes everything it added: the program
 in `C:\Program Files\Macify`, the `Macify` scheduled task, the startup entry, the Start
-menu shortcut, and your settings and learned pointer speed in `%APPDATA%\Macify`.
+menu shortcut, and everything in `%APPDATA%\Macify` (your settings, the learned pointer
+speed and the icons folder). Shortcuts whose icons it changed get their original icons
+back.
 
 (Running `"C:\Program Files\Macify\macify.exe" --uninstall` does the same. Copies
 installed before 1.18 show up in Installed apps once they've updated to 1.18.)
