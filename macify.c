@@ -158,7 +158,6 @@
 // Debug log: off unless switched on from the tray menu; then lines are collected in
 // memory and saved to the desktop on "Finish debug mode". Costs one check while off.
 static volatile bool gDebugOn;
-static ULONG_PTR gLoggedHkl;  // the keyboard layout last written to the debug log
 static void debugLog(const char *fmt, ...);
 #define LOG(...) do { if (gDebugOn) debugLog(__VA_ARGS__); } while (0)
 static void debugStart(void);
@@ -891,8 +890,6 @@ typedef struct {
 typedef struct {
   KeySpec from, to;
   char fromText[48], toText[48];  // as written in the file
-  LANGID lang;                    // keyRemapsForLayout: only while this layout is active (0: any)
-  char layout[16];                // its language tag as written, like sv-SE
 } Remap;
 
 static Remap gRemaps[MAX_REMAPS];
@@ -964,20 +961,9 @@ static bool parseKeySpec(const char *text, KeySpec *k, char *why, size_t whyLen)
 
 // One "keys you press": "keys sent instead" entry, checked. Adds it (replacing an entry
 // for the same keys) or explains why not.
-// A language tag like sv-SE as a LANGID, or 0 if Windows doesn't know it.
-static LANGID tagToLang(const char *tag) {
-  wchar_t w[LOCALE_NAME_MAX_LENGTH];
-  if (!MultiByteToWideChar(CP_UTF8, 0, tag, -1, w, LOCALE_NAME_MAX_LENGTH)) return 0;
-  LCID lcid = LocaleNameToLCID(w, 0);
-  return lcid && lcid != LOCALE_CUSTOM_UNSPECIFIED ? LANGIDFROMLCID(lcid) : 0;
-}
-
-static bool addRemap(Remap *list, int *count, const char *from, const char *to, LANGID lang, const char *layout,
-                     char *why, size_t whyLen) {
+static bool addRemap(Remap *list, int *count, const char *from, const char *to, char *why, size_t whyLen) {
   Remap r;
   memset(&r, 0, sizeof r);
-  r.lang = lang;
-  snprintf(r.layout, sizeof r.layout, "%s", lang ? layout : "");
   char reason[120];
   if (!parseKeySpec(from, &r.from, reason, sizeof reason)) { snprintf(why, whyLen, "\"%s\": %s", from, reason); return false; }
   if (!parseKeySpec(to, &r.to, reason, sizeof reason)) { snprintf(why, whyLen, "\"%s\": %s", to, reason); return false; }
@@ -992,8 +978,7 @@ static bool addRemap(Remap *list, int *count, const char *from, const char *to, 
   snprintf(r.fromText, sizeof r.fromText, "%s", from);
   snprintf(r.toText, sizeof r.toText, "%s", to);
   for (int i = 0; i < *count; i++)
-    if (list[i].lang == r.lang && list[i].from.mods == r.from.mods && list[i].from.vk == r.from.vk &&
-        list[i].from.ch == r.from.ch) {
+    if (list[i].from.mods == r.from.mods && list[i].from.vk == r.from.vk && list[i].from.ch == r.from.ch) {
       list[i] = r;
       return true;
     }
@@ -1002,19 +987,11 @@ static bool addRemap(Remap *list, int *count, const char *from, const char *to, 
   return true;
 }
 
-// Removes the remaps for all layouts (layout == false) or the layout-specific ones.
-static void dropRemaps(Remap *list, int *count, bool layout) {
-  int n = 0;
-  for (int i = 0; i < *count; i++)
-    if ((list[i].lang != 0) != layout) list[n++] = list[i];
-  *count = n;
-}
-
-// Adds the default keyRemaps to what the list already has. (keyRemapsForLayout has none.)
+// Adds the default keyRemaps to what the list already has.
 static void defaultRemaps(Remap *list, int *count) {
   char why[160];
   for (size_t i = 0; i < sizeof kDefaultRemaps / sizeof *kDefaultRemaps; i++)
-    addRemap(list, count, kDefaultRemaps[i][0], kDefaultRemaps[i][1], 0, NULL, why, sizeof why);
+    addRemap(list, count, kDefaultRemaps[i][0], kDefaultRemaps[i][1], why, sizeof why);
 }
 
 static void setRemaps(const Remap *list, int count) {
@@ -1141,39 +1118,6 @@ static UINT charVk(wchar_t ch, UINT fallback) {
   return (UINT)(r & 0xFF);
 }
 
-// The language of a keyboard layout itself (Swedish for the Swedish keyboard), which can
-// differ from the input language Windows pairs it with (like English with a Swedish
-// keyboard). The high word of an HKL is that language, or for layout variants (0xFnnn)
-// an index looked up in the registry's list of keyboard layouts.
-static LANGID keyboardLang(HKL hkl) {
-  WORD dev = HIWORD((ULONG_PTR)hkl);
-  if ((dev & 0xF000) != 0xF000) return dev;
-  static WORD cachedDev;
-  static LANGID cachedLang;
-  if (dev == cachedDev) return cachedLang;
-  LANGID lang = 0;
-  HKEY key;
-  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts", 0, KEY_READ, &key) == ERROR_SUCCESS) {
-    wchar_t name[16], id[16];
-    for (DWORD i = 0; !lang; i++) {
-      DWORD nameLen = 16;
-      if (RegEnumKeyExW(key, i, name, &nameLen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
-      DWORD size = sizeof id;
-      if (RegGetValueW(key, name, L"Layout Id", RRF_RT_REG_SZ, NULL, id, &size) == ERROR_SUCCESS &&
-          wcstoul(id, NULL, 16) == (dev & 0x0FFFu))
-        lang = (LANGID)(wcstoul(name, NULL, 16) & 0xFFFF);
-    }
-    RegCloseKey(key);
-  }
-  cachedDev = dev;
-  cachedLang = lang;
-  return lang;
-}
-
-static void tagFor(LANGID lang, wchar_t *tag) {
-  if (!lang || !LCIDToLocaleName(MAKELCID(lang, SORT_DEFAULT), tag, LOCALE_NAME_MAX_LENGTH, 0)) wcscpy(tag, L"?");
-}
-
 // The key remaps. Returns true if the key was handled (and must be swallowed). Like
 // AutoHotkey hotkeys, a remap fires only with exactly its modifiers held.
 static bool runHotkey(UINT vk) {
@@ -1186,30 +1130,15 @@ static bool runHotkey(UINT vk) {
   if (mods & KM_WIN) return false;
   KeySpec out;
   bool found = false;
-  // The current layout's remaps first, then those for every layout.
-  // A layout's remaps match its keyboard (sv-SE: a Swedish keyboard) or, failing that, its
-  // input language (sv-SE: Swedish with any keyboard). Then the remaps for every layout.
-  HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
-  LANGID langs[3] = { keyboardLang(hkl), LOWORD((ULONG_PTR)hkl), 0 };
-  if (gDebugOn && (ULONG_PTR)hkl != gLoggedHkl) {  // shows the tag to use in keyRemapsForLayout
-    gLoggedHkl = (ULONG_PTR)hkl;
-    wchar_t kb[LOCALE_NAME_MAX_LENGTH], in[LOCALE_NAME_MAX_LENGTH];
-    tagFor(langs[0], kb);
-    tagFor(langs[1], in);
-    LOG("keyboard layout: %ls keyboard, %ls input language\n", kb, in);
-  }
   AcquireSRWLockShared(&gRemapLock);
-  for (int pass = 0; pass < 3 && !found; pass++) {
-    if (pass < 2 && !langs[pass]) continue;
-    for (int i = 0; i < gRemapCount && !found; i++) {
-      const Remap *r = &gRemaps[i];
-      if (r->lang != langs[pass] || r->from.mods != mods) continue;
-      UINT fromVk = r->from.vk ? r->from.vk : charVk(r->from.ch, 0);
-      if (!fromVk || fromVk != vk) continue;
-      out = r->to;
-      found = true;
-      LOG("remap %s -> %s%s%s\n", r->fromText, r->toText, r->lang ? ", for " : "", r->layout);
-    }
+  for (int i = 0; i < gRemapCount && !found; i++) {
+    const Remap *r = &gRemaps[i];
+    if (r->from.mods != mods) continue;
+    UINT fromVk = r->from.vk ? r->from.vk : charVk(r->from.ch, 0);
+    if (!fromVk || fromVk != vk) continue;
+    out = r->to;
+    found = true;
+    LOG("remap %s -> %s\n", r->fromText, r->toText);
   }
   ReleaseSRWLockShared(&gRemapLock);
   if (!found) return false;
@@ -2582,14 +2511,6 @@ static void logState(void) {
   logRegString("Windows", L"ProductName");
   logRegString("Windows version", L"DisplayVersion");
   logRegString("Windows build", L"CurrentBuild");
-  {
-    HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
-    wchar_t kb[LOCALE_NAME_MAX_LENGTH], in[LOCALE_NAME_MAX_LENGTH];
-    tagFor(keyboardLang(hkl), kb);
-    tagFor(LOWORD((ULONG_PTR)hkl), in);
-    LOG("keyboard layout: %ls keyboard, %ls input language (id %08lX); logged again whenever it changes\n", kb, in,
-        (unsigned long)(ULONG_PTR)hkl);
-  }
   LOG("check for updates on start: %s\n", gCheckUpdates ? "on" : "off");
   LOG("admin rights: %s, installed copy: %s, run at startup: %s\n", isElevated() ? "yes" : "no",
       isInstalledCopy() ? "yes" : "no", gRunAtStartup ? "on" : "off");
@@ -2616,7 +2537,7 @@ static void logState(void) {
   LOG("settings: runAtStartup %d, runAsAdministrator %d\n", gRunAtStartup, gRunAsAdmin);
   AcquireSRWLockShared(&gRemapLock);
   for (int i = 0; i < gRemapCount; i++)
-    LOG("  remap %s -> %s%s%s\n", gRemaps[i].fromText, gRemaps[i].toText, gRemaps[i].lang ? ", for " : "", gRemaps[i].layout);
+    LOG("  remap %s -> %s\n", gRemaps[i].fromText, gRemaps[i].toText);
   ReleaseSRWLockShared(&gRemapLock);
   LOG("--- events ---\n");
 }
@@ -2629,7 +2550,6 @@ static void debugStart(void) {
   gLogFull = false;
   QueryPerformanceCounter(&gLogStart);
   gDebugOn = true;
-  gLoggedHkl = 0;
   LeaveCriticalSection(&gLogLock);
   logState();
   trayNotify(L"Macify debug mode started",
@@ -2678,9 +2598,8 @@ static void debugFinish(void) {
 #define FOUND_UPDATES 16
 #define FOUND_JUMP    32
 #define FOUND_TBCOLORS 64
-#define FOUND_LAYOUTS 128
 #define FOUND_ICONS   256
-#define FOUND_ALL     (511 & ~FOUND_FREE)
+#define FOUND_ALL     (511 & ~FOUND_FREE & ~128)  // 128: was keyRemapsForLayout (1.27-1.30)
 #define FOUND_OBSOLETE 1024  // a setting that no longer exists: rewrite the file without it
 
 typedef struct {
@@ -2779,7 +2698,6 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
     } else if (strcmp(key, "keyRemaps") == 0) {
       if (*j.p != '{') { snprintf(err, errLen, "\"keyRemaps\" must be { ... } (line %d)", line); return false; }
       j.p++;
-      dropRemaps(st->remaps, &st->remapCount, false);
       st->found |= FOUND_REMAPS;
       for (;;) {
         jsonSkip(&j);
@@ -2792,7 +2710,7 @@ static bool parseSettings(const char *text, Settings *st, char *err, size_t errL
         j.p++;
         jsonSkip(&j);
         if (!jsonString(&j, to, sizeof to)) { snprintf(err, errLen, "\"%s\" needs \"keys\" to send (line %d)", from, entryLine); return false; }
-        if (!addRemap(st->remaps, &st->remapCount, from, to, 0, NULL, why, sizeof why)) {
+        if (!addRemap(st->remaps, &st->remapCount, from, to, why, sizeof why)) {
           size_t used = strlen(st->skipped);
           snprintf(st->skipped + used, sizeof st->skipped - used, "%s%s (line %d)", used ? "; " : "", why, entryLine);
         }
@@ -2914,8 +2832,6 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
   static char buf[8192];
   snprintf(buf, sizeof buf, "%s", text);
   bool inRemaps = false, inColors = false, inOldApps = false, inLayouts = false;
-  char layout[64] = "";  // the layout being read in keyRemapsForLayout
-  LANGID layoutLang = 0;
   int lineNo = 0;
   for (char *line = buf, *next; line; line = next) {
     next = strchr(line, '\n');
@@ -2951,26 +2867,14 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
       if (!tbAddEntry(st, key, value, lineNo, err, errLen)) return false;
       continue;
     }
-    if (indented && inLayouts && (!*value || !strcmp(rawValue, "{}"))) {  // a layout: "sv-SE:"
-      snprintf(layout, sizeof layout, "%s", key);
-      layoutLang = tagToLang(key);
-      if (!layoutLang) {
-        size_t used = strlen(st->skipped);
-        snprintf(st->skipped + used, sizeof st->skipped - used, "%s\"%s\": not a language tag like sv-SE (line %d)",
-                 used ? "; " : "", key, lineNo);
-      }
-      continue;
-    }
+    // keyRemapsForLayout (1.27-1.30): its remaps join keyRemaps, replacing the same keys,
+    // and the file is rewritten without it. Its layout lines ("sv-SE:") are skipped.
+    if (indented && inLayouts && (!*value || !strcmp(rawValue, "{}"))) continue;
     if (indented) {  // an entry under keyRemaps or a layout
       if (!inRemaps && !inLayouts) { snprintf(err, errLen, "line %d is indented, but isn't under keyRemaps", lineNo); return false; }
-      if (inLayouts && !layout[0]) {
-        snprintf(err, errLen, "line %d: remaps in keyRemapsForLayout go under a layout, like  sv-SE:", lineNo);
-        return false;
-      }
-      if (inLayouts && !layoutLang) continue;  // unknown layout: already reported
       char why[160];
       if (!*value) snprintf(why, sizeof why, "\"%s\": no keys to send", key);
-      if (!*value || !addRemap(st->remaps, &st->remapCount, key, value, inLayouts ? layoutLang : 0, layout, why, sizeof why)) {
+      if (!*value || !addRemap(st->remaps, &st->remapCount, key, value, why, sizeof why)) {
         size_t used = strlen(st->skipped);
         snprintf(st->skipped + used, sizeof st->skipped - used, "%s%s (line %d)", used ? "; " : "", why, lineNo);
       }
@@ -3013,17 +2917,10 @@ static bool parseSettingsYaml(const char *text, Settings *st, char *err, size_t 
         return false;
       }
       st->found |= FOUND_REMAPS;
-      dropRemaps(st->remaps, &st->remapCount, false);
       inRemaps = !*value;
-    } else if (!strcmp(key, "keyRemapsForLayout")) {
-      if (*value && strcmp(rawValue, "{}") != 0) {
-        snprintf(err, errLen, "keyRemapsForLayout (line %d) should be followed by indented layouts like  sv-SE:", lineNo);
-        return false;
-      }
-      st->found |= FOUND_LAYOUTS;
-      dropRemaps(st->remaps, &st->remapCount, true);
+    } else if (!strcmp(key, "keyRemapsForLayout")) {  // 1.27-1.30, see above
+      st->found |= FOUND_OBSOLETE;
       inLayouts = !*value;
-      layout[0] = 0;
     } else if (!strcmp(key, "checkForUpdatesOnStart")) {
       if (!yamlBool(value, &st->checkUpdates)) { snprintf(err, errLen, "%s must be true or false (line %d)", key, lineNo); return false; }
       st->found |= FOUND_UPDATES;
@@ -3096,15 +2993,6 @@ static const char kHelpRemaps[] =
   "#   Delete keyRemaps to get its default remaps back; keyRemaps: {} turns them all off.\n"
   "#   Always on, not changeable here: the left Windows key is Ctrl, left Alt+W is the\n"
   "#   Windows key, and Ctrl+click or Alt+click is a right-click.\n";
-static const char kHelpLayouts[] =
-  "# Key remaps for one keyboard layout, used only while it's active (Win+Space switches).\n"
-  "# Each layout is its language tag, like sv-SE, en-US or de-DE (the debug log shows the\n"
-  "# current one), followed by its remaps, indented further and written as above. For the\n"
-  "# same keys, these replace the ones in keyRemaps. Like:\n"
-  "#   keyRemapsForLayout:\n"
-  "#     sv-SE:\n"
-  "#       Alt+1: Ctrl+Alt+1\n"
-  "# {} means none (the default).\n";
 
 // Writes a key or value, quoted only if YAML would otherwise misread it.
 static void yamlPut(FILE *f, const char *text) {
@@ -3155,34 +3043,13 @@ static void settingsWrite(void) {
   yamlPut(f, folder);
   fprintf(f, "\n\n%s", kHelpRemaps);
   AcquireSRWLockShared(&gRemapLock);
-  int general = 0, layouts = 0;
-  for (int i = 0; i < gRemapCount; i++) { if (gRemaps[i].lang) layouts++; else general++; }
-  fputs(general ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
+  fputs(gRemapCount ? "keyRemaps:\n" : "keyRemaps: {}\n", f);
   for (int i = 0; i < gRemapCount; i++) {
-    if (gRemaps[i].lang) continue;
     fputs("  ", f);
     yamlPut(f, gRemaps[i].fromText);
     fputs(": ", f);
     yamlPut(f, gRemaps[i].toText);
     fputc('\n', f);
-  }
-  fprintf(f, "\n%s%s", kHelpLayouts, layouts ? "keyRemapsForLayout:\n" : "keyRemapsForLayout: {}\n");
-  for (int i = 0; i < gRemapCount; i++) {  // grouped by layout, in the order they first appear
-    if (!gRemaps[i].lang) continue;
-    bool seen = false;
-    for (int j = 0; j < i && !seen; j++) seen = gRemaps[j].lang == gRemaps[i].lang;
-    if (seen) continue;
-    fputs("  ", f);
-    yamlPut(f, gRemaps[i].layout);
-    fputs(":\n", f);
-    for (int j = i; j < gRemapCount; j++) {
-      if (gRemaps[j].lang != gRemaps[i].lang) continue;
-      fputs("    ", f);
-      yamlPut(f, gRemaps[j].fromText);
-      fputs(": ", f);
-      yamlPut(f, gRemaps[j].toText);
-      fputc('\n', f);
-    }
   }
   ReleaseSRWLockShared(&gRemapLock);
   fclose(f);
@@ -3277,7 +3144,7 @@ static void settingsRemoveLine(const char *name, const char *help) {
 
 // Applies parsed settings. userEdit: the user saved the file, so confirm the changes.
 static void settingsApply(Settings *st, bool userEdit) {
-  // Defaults for what the file leaves out (keyRemapsForLayout has none).
+  // Defaults for what the file leaves out.
   if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount);
   bool dragChanged = st->jump != gJumpMm;
   bool startupChanged = st->runAtStartup != gRunAtStartup || st->runAsAdmin != gRunAsAdmin;
@@ -3310,7 +3177,7 @@ static void settingsApply(Settings *st, bool userEdit) {
   // Settings added since: insert just those, keeping the user's file (and comments) as is.
   if ((st->found & FOUND_SPEED) && !(st->found & FOUND_OBSOLETE)) settingsRemoveLine("threeFingerDragSpeed", kHelpSpeedOld);
   int missing = FOUND_ALL & ~st->found;
-  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBCOLORS | FOUND_LAYOUTS | FOUND_ICONS))) {
+  if (!(st->found & FOUND_OBSOLETE) && missing && !(missing & ~(FOUND_UPDATES | FOUND_JUMP | FOUND_TBCOLORS | FOUND_ICONS))) {
     if (missing & FOUND_UPDATES)
       settingsInsertLine(kHelpUpdates, "checkForUpdatesOnStart: true", "# Some touchpads briefly report");
     if (missing & FOUND_JUMP)
@@ -3319,8 +3186,6 @@ static void settingsApply(Settings *st, bool userEdit) {
       settingsInsertLine(kHelpTbColors, "titleBarColors: {}", "# Key remaps");
     if (missing & FOUND_ICONS)
       settingsInsertLine(kHelpIcons, "appIconsFolder: \"\"", "# Key remaps");
-    if (missing & FOUND_LAYOUTS)
-      settingsInsertLine(kHelpLayouts, "keyRemapsForLayout: {}", "\x01");  // at the end
   } else if (missing || (st->found & FOUND_OBSOLETE)) {
     settingsWrite();
   }

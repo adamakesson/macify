@@ -17,8 +17,8 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
   to drag windows or select text, as if holding the left button.
 - **The Windows key acts as Ctrl**, in the place of a Mac's Cmd key (see
   [Windows key = Ctrl key](#windows-key--ctrl-key)).
-- **Key remaps**: Mac-style shortcuts, which you can change in the settings file, also
-  per keyboard layout (see [Key remaps](#key-remaps)).
+- **Key remaps**: Mac-style shortcuts, which you can change in the settings file (see
+  [Key remaps](#key-remaps)).
 - **Ctrl+click and Alt+click** give a plain right-click, and a three-finger drag started
   with Ctrl or Alt held is a right-button drag.
 - **Title bar colors** for apps that don't follow Windows' dark mode (see
@@ -96,29 +96,6 @@ keyRemaps:
   typing its characters, even when Alt with the same key is remapped.
 - An entry with a mistake is skipped, with a notification saying why; the others still
   work. `keyRemaps: {}` turns them all off.
-
-### For one keyboard layout
-
-Remaps under `keyRemapsForLayout` are used only while that keyboard layout is active
-(Win+Space switches layouts):
-
-```yaml
-keyRemapsForLayout:
-  sv-SE:
-    Alt+1: Ctrl+Alt+1
-    Alt+<: Ctrl+Alt+<
-  en-US:
-    Alt+3: Ctrl+Alt+3
-```
-
-- Each layout is written as a language tag: `sv-SE`, `en-US`, `de-DE`, `nb-NO`, … It
-  matches that language's keyboard (`sv-SE`: the Swedish keyboard, even with English as
-  the input language), or else that input language with any keyboard. The keyboard comes
-  first. The [debug log](#debug-mode) shows both for the current layout.
-- For the same keys, a layout's remap replaces the one in `keyRemaps`; other keys still use
-  `keyRemaps`.
-- Characters like `<` are the keys that type them on that layout.
-- `keyRemapsForLayout: {}` (the default) means none.
 
 ## Ctrl+click and Alt+click
 
@@ -201,7 +178,6 @@ appIconsFolder: ""
 keyRemaps:
   Ctrl+D: Delete
   # ... the other key remaps
-keyRemapsForLayout: {}
 ```
 
 The file starts with a comment explaining every setting. (Versions up to 1.8 used
@@ -216,7 +192,6 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `titleBarColors` | Apps whose title bar gets a color, see [Title bar colors](#title-bar-colors). `{}` (the default) means none |
 | `appIconsFolder` | Folder with replacement app icons, see [App icons](#app-icons). `""` (the default) means `%APPDATA%\Macify\icons`. Environment variables like `%USERPROFILE%` work |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
-| `keyRemapsForLayout` | Key remaps for one keyboard layout, see [For one keyboard layout](#for-one-keyboard-layout) |
 
 ## Debug mode
 
@@ -224,8 +199,7 @@ Tray icon → **Start debug mode**, reproduce the problem, then press **Esc** (o
 **Finish debug mode**): a `Macify debug log <date>.txt` appears on the desktop. While debug
 mode is on, Esc only finishes it and isn't passed on to apps. It starts with the app's state
 (Windows version, touchpad details, learned speed curve) followed by events: drags,
-filtered touchpad artefacts, cursor lag, learning, remapped shortcuts and clicks, and the
-keyboard layout's language tag whenever you type with a different layout.
+filtered touchpad artefacts, cursor lag, learning, and remapped shortcuts and clicks.
 It never records what you type. Logging costs nothing while off.
 
 ## Updating
