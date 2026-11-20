@@ -906,15 +906,6 @@ static const char *const kDefaultRemaps[][2] = {
   { "Ctrl+I", "Ctrl+Shift+C" },
 };
 
-// Defaults for one layout: the AltGr characters on a Swedish keyboard, on Alt.
-#define DEFAULT_LAYOUT "sv-SE"
-static const char *const kDefaultLayoutRemaps[][2] = {
-  { "Alt+1", "Ctrl+Alt+1" },        { "Alt+2", "Ctrl+Alt+2" },        { "Alt+3", "Ctrl+Alt+3" },
-  { "Alt+4", "Ctrl+Alt+4" },        { "Alt+7", "Ctrl+Alt+7" },        { "Alt+8", "Ctrl+Alt+8" },
-  { "Alt+9", "Ctrl+Alt+9" },        { "Alt+0", "Ctrl+Alt+0" },        { "Alt++", "Ctrl+Alt++" },
-  { "Alt+<", "Ctrl+Alt+<" },
-};
-
 static const struct { const char *name; UINT vk; } kKeyNames[] = {
   { "Delete", VK_DELETE }, { "Del", VK_DELETE }, { "Backspace", VK_BACK }, { "Enter", VK_RETURN },
   { "Return", VK_RETURN }, { "Tab", VK_TAB }, { "Esc", VK_ESCAPE }, { "Escape", VK_ESCAPE },
@@ -1019,17 +1010,11 @@ static void dropRemaps(Remap *list, int *count, bool layout) {
   *count = n;
 }
 
-// The default keyRemaps (general: true) or keyRemapsForLayout (general: false), added
-// to what the list already has.
-static void defaultRemaps(Remap *list, int *count, bool general) {
+// Adds the default keyRemaps to what the list already has. (keyRemapsForLayout has none.)
+static void defaultRemaps(Remap *list, int *count) {
   char why[160];
-  if (general)
-    for (size_t i = 0; i < sizeof kDefaultRemaps / sizeof *kDefaultRemaps; i++)
-      addRemap(list, count, kDefaultRemaps[i][0], kDefaultRemaps[i][1], 0, NULL, why, sizeof why);
-  else
-    for (size_t i = 0; i < sizeof kDefaultLayoutRemaps / sizeof *kDefaultLayoutRemaps; i++)
-      addRemap(list, count, kDefaultLayoutRemaps[i][0], kDefaultLayoutRemaps[i][1], tagToLang(DEFAULT_LAYOUT),
-               DEFAULT_LAYOUT, why, sizeof why);
+  for (size_t i = 0; i < sizeof kDefaultRemaps / sizeof *kDefaultRemaps; i++)
+    addRemap(list, count, kDefaultRemaps[i][0], kDefaultRemaps[i][1], 0, NULL, why, sizeof why);
 }
 
 static void setRemaps(const Remap *list, int count) {
@@ -3083,7 +3068,7 @@ static const char kHelpJump[] =
   "# drag starts fast, which makes the cursor jump. A sudden change of more than this many mm\n"
   "# between two touchpad reports is held back until it's clear whether it was real. It never\n"
   "# limits how fast you can drag. 0 (the default) turns this off. If your cursor jumps when\n"
-  "# you start a drag fast, try 3.\n";
+  "# you start a drag fast, try 2.\n";
 static const char kHelpIcons[] =
   "# Folder with replacement app icons, each named after the app's program file (see Task\n"
   "# Manager > Details): Plex.ico or Plex.png replaces the icon of Plex.exe, in its windows\n"
@@ -3095,7 +3080,7 @@ static const char kHelpTbColors[] =
   "# color as \"#RRGGBB\" with the quotes. Text and buttons turn white or black, whichever is\n"
   "# readable on that color. Windows 11 only. Like:\n"
   "#   titleBarColors:\n"
-  "#     Plex.exe: \"#202020\"\n"
+  "#     Plex.exe: \"#1C1C1C\"\n"
   "# {} means none.\n";
 static const char kHelpRemaps[] =
   "# Key remaps, one indented line each:  keys you press: keys sent instead\n"
@@ -3119,8 +3104,7 @@ static const char kHelpLayouts[] =
   "#   keyRemapsForLayout:\n"
   "#     sv-SE:\n"
   "#       Alt+1: Ctrl+Alt+1\n"
-  "# {} means none. Delete both keyRemaps and keyRemapsForLayout to get all the default\n"
-  "# remaps back.\n";
+  "# {} means none (the default).\n";
 
 // Writes a key or value, quoted only if YAML would otherwise misread it.
 static void yamlPut(FILE *f, const char *text) {
@@ -3293,10 +3277,8 @@ static void settingsRemoveLine(const char *name, const char *help) {
 
 // Applies parsed settings. userEdit: the user saved the file, so confirm the changes.
 static void settingsApply(Settings *st, bool userEdit) {
-  // Defaults for what the file leaves out. A file from before 1.27 has keyRemaps but no
-  // keyRemapsForLayout: its own remaps stay as they are, with no layout remaps added.
-  if (!(st->found & FOUND_LAYOUTS) && !(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount, false);
-  if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount, true);
+  // Defaults for what the file leaves out (keyRemapsForLayout has none).
+  if (!(st->found & FOUND_REMAPS)) defaultRemaps(st->remaps, &st->remapCount);
   bool dragChanged = st->jump != gJumpMm;
   bool startupChanged = st->runAtStartup != gRunAtStartup || st->runAsAdmin != gRunAsAdmin;
   AcquireSRWLockShared(&gRemapLock);

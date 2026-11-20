@@ -17,8 +17,8 @@ Small Windows background app that makes a Windows laptop behave more like a Mac:
   to drag windows or select text, as if holding the left button.
 - **The Windows key acts as Ctrl**, in the place of a Mac's Cmd key (see
   [Windows key = Ctrl key](#windows-key--ctrl-key)).
-- **Key remaps**: Mac-style shortcuts for a Swedish keyboard layout, which you can change
-  in the settings file (see [Key remaps](#key-remaps)).
+- **Key remaps**: Mac-style shortcuts, which you can change in the settings file, also
+  per keyboard layout (see [Key remaps](#key-remaps)).
 - **Ctrl+click and Alt+click** give a plain right-click, and a three-finger drag started
   with Ctrl or Alt held is a right-button drag.
 - **Title bar colors** for apps that don't follow Windows' dark mode (see
@@ -59,7 +59,7 @@ This is always on and can't be changed in the settings file.
 
 ## Key remaps
 
-Shortcuts that send other keys instead. These are the defaults, for every keyboard layout:
+Shortcuts that send other keys instead. These are the defaults:
 
 | Keys | Result |
 |---|---|
@@ -68,13 +68,6 @@ Shortcuts that send other keys instead. These are the defaults, for every keyboa
 | Ctrl+Shift+3 | Win+PrintScreen (screenshot, saved to Pictures) |
 | Ctrl+Shift+4 | Win+Shift+S (snip part of the screen) |
 | Ctrl+I | Ctrl+Shift+C |
-
-And only with the Swedish layout (`sv-SE`), where they type the AltGr character on that key:
-
-| Keys | Result |
-|---|---|
-| Alt+1, 2, 3, 4, 7, 8, 9, 0, `+` | `@ £ $ { [ ] } \` |
-| Alt+`<` | `\|` |
 
 "Ctrl" includes the left Windows key. A remap only fires with exactly those modifiers
 held, the way AutoHotkey hotkeys do: Ctrl+D doesn't fire for Ctrl+Shift+D. Modifiers that
@@ -125,9 +118,7 @@ keyRemapsForLayout:
 - For the same keys, a layout's remap replaces the one in `keyRemaps`; other keys still use
   `keyRemaps`.
 - Characters like `<` are the keys that type them on that layout.
-- `keyRemapsForLayout: {}` means none. Delete both `keyRemaps` and `keyRemapsForLayout` to
-  get all the default remaps back. (A settings file from before 1.27 gets
-  `keyRemapsForLayout: {}`, so its own `keyRemaps` keep working as before.)
+- `keyRemapsForLayout: {}` (the default) means none.
 
 ## Ctrl+click and Alt+click
 
@@ -143,7 +134,7 @@ their windows a title bar in that color, the way Mica For Everyone does:
 
 ```yaml
 titleBarColors:
-  Plex.exe: "#202020"
+  Plex.exe: "#1C1C1C"
 ```
 
 - Write each app's program file name, as shown in Task Manager → Details.
@@ -210,10 +201,7 @@ appIconsFolder: ""
 keyRemaps:
   Ctrl+D: Delete
   # ... the other key remaps
-keyRemapsForLayout:
-  sv-SE:
-    Alt+1: Ctrl+Alt+1
-    # ...
+keyRemapsForLayout: {}
 ```
 
 The file starts with a comment explaining every setting. (Versions up to 1.8 used
@@ -224,7 +212,7 @@ The file starts with a comment explaining every setting. (Versions up to 1.8 use
 | `runAtStartup` | Start Macify when you log in |
 | `runAsAdministrator` | Run with admin rights, so it also works in admin windows. Uses a scheduled task (`Macify`), so there's no prompt at login or when starting it from the Start menu. Turning it on asks for admin rights once |
 | `checkForUpdatesOnStart` | Shortly after Macify starts, check here for a newer version. If there is one, it's downloaded in the background and a notification offers it: click it, or choose **Install Macify …** in the tray menu. Silent when there's nothing new |
-| `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` (the default) turns it off; if your cursor jumps when you start a drag fast, try `3` |
+| `threeFingerDragJumpThreshold` | Protection against touchpads that briefly report a much bigger movement than the real one (mostly when a drag starts fast), which makes the cursor jump. A sudden change of more than this many mm between two touchpad reports is held back until it's clear whether it was real. It never limits how fast you can drag. `0` (the default) turns it off; if your cursor jumps when you start a drag fast, try `2` |
 | `titleBarColors` | Apps whose title bar gets a color, see [Title bar colors](#title-bar-colors). `{}` (the default) means none |
 | `appIconsFolder` | Folder with replacement app icons, see [App icons](#app-icons). `""` (the default) means `%APPDATA%\Macify\icons`. Environment variables like `%USERPROFILE%` work |
 | `keyRemaps` | Key remaps, see [Key remaps](#key-remaps) |
